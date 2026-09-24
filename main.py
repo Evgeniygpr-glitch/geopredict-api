@@ -7,38 +7,60 @@ import folium
 app = FastAPI()
 elevation_data = srtm.get_data()
 
-def calc_slope_and_aspect(grid, r, c, cell_size=30.0):
+def calc_geomorphology(grid, r, c, cell_size=30.0):
+    """
+    Обчислення схилу, азимуту (aspect) та коефіцієнта сонячної освітленості
+    """
     dz_dx = (grid[r][c+1] - grid[r][c-1]) / (2 * cell_size)
     dz_dy = (grid[r+1][c] - grid[r-1][c]) / (2 * cell_size)
     slope_deg = math.degrees(math.atan(math.sqrt(dz_dx**2 + dz_dy**2)))
     aspect_deg = math.degrees(math.atan2(-dz_dy, dz_dx)) % 360
-    return slope_deg, aspect_deg
+    
+    # Розрахунок освітленості (ідеал: Пд-Сх / Пд від 110° до 160°)
+    # 135° (Пд-Сх) отримує 1.0, Північ (0°/360°) отримує 0.0
+    aspect_rad = math.radians(aspect_deg)
+    ideal_rad = math.radians(135.0) # Оптимальне ранкове/денне сонце
+    
+    sun_score = max(0.0, math.cos(aspect_rad - ideal_rad))
+    return slope_deg, aspect_deg, round(sun_score, 2)
 
-def analyze_promontory_and_water(grid, r, c, cell_size=30.0):
+def detect_promontory_tip(grid, r, c):
     """
-    Аналіз геометрії мису та доступності води для Київської Русі
+    Детектор КІНЧИКА (носа) мису:
+    Шукає точку, де з 3-х боків обрив/спад, а з 1-го боку — плато.
     """
+    z = grid[r][c]
+    rows, cols = len(grid), len(grid[0])
+    
+    # 8 напрямків: Пн, Пд, Зах, Сх, і 4 діагоналі (крок ~60м / 2 пікселі)
+    dirs = [(-2,0), (2,0), (0,-2), (0,2), (-2,-2), (-2,2), (2,-2), (2,2)]
+    lower_sectors = 0
+    
+    for dr, dc in dirs:
+        nr, nc = r + dr, c + dc
+        if 0 <= nr < rows and 0 <= nc < cols:
+            if z - grid[nr][nc] >= 8.0: # Спад висоти на 8+ метрів
+                lower_sectors += 1
+                
+    # Край мису: 4, 5 або 6 секторів знизу (ідеальний ніс)
+    if 4 <= lower_sectors <= 6:
+        return 1.0  # Це чіткий ніс мису
+    elif lower_sectors == 3:
+        return 0.5  # Бічна кромка
+    else:
+        return 0.0  # Рівне поле або глибокий яр
+
+def analyze_site_precision(grid, r, c, cell_size=30.0):
     z_center = grid[r][c]
     rows, cols = len(grid), len(grid[0])
     
-    # 1. Перевірка скиду висот у 8 напрямках на відстані ~90 м (3 пікселі)
-    drops = 0
-    directions = [(-3,0), (3,0), (0,-3), (0,3), (-2,-2), (-2,2), (2,-2), (2,2)]
-    for dr, dc in directions:
-        nr, nc = r + dr, c + dc
-        if 0 <= nr < rows and 0 <= nc < cols:
-            if z_center - grid[nr][nc] >= 10.0:  # перепад понад 10м
-                drops += 1
-                
-    # Форма мису: обрив з 4-6 боків (ідеально для носа мису з ярами по боках)
-    if 4 <= drops <= 6:
-        s_prom = 1.0
-    elif drops == 3 or drops == 7:
-        s_prom = 0.6
-    else:
-        s_prom = 0.1  # рівне плато або прямий схил
+    slope_deg, aspect_deg, sun_score = calc_geomorphology(grid, r, c, cell_size)
+    tip_score = detect_promontory_tip(grid, r, c)
+    
+    if tip_score == 0.0:
+        return None  # Відсікаємо все, що не є мисом/краєм
         
-    # 2. Пошук дна долини / річки в радіусі 300 м (10 пікселів)
+    # Пошук дна водотоку в радіусі 300м
     min_z = z_center
     dist_to_water_m = 999.0
     
@@ -51,48 +73,40 @@ def analyze_promontory_and_water(grid, r, c, cell_size=30.0):
                 if val < min_z:
                     min_z = val
                     dist_to_water_m = dist_m
-                elif val == min_z and dist_m < dist_to_water_m:
-                    dist_to_water_m = dist_m
                     
-    delta_h = z_center - min_z  # висота над водою
+    delta_h = z_center - min_z
     
-    # Фактор відстані до води (ідеал: 50 - 250 метрів)
-    if 40.0 <= dist_to_water_m <= 250.0:
-        s_dist = 1.0
-    elif 250.0 < dist_to_water_m <= 400.0:
-        s_dist = 0.6
-    else:
-        s_dist = 0.2
-        
-    # Фактор висоти над водою (ідеал: 12 - 30 метрів)
-    if 12.0 <= delta_h <= 30.0:
-        s_height = 1.0
-    elif 8.0 <= delta_h < 12.0 or 30.0 < delta_h <= 45.0:
-        s_height = 0.6
-    else:
-        s_height = 0.2
-        
-    s_water = 0.6 * s_dist + 0.4 * s_height
-    return s_prom, s_water, delta_h, round(dist_to_water_m)
-
-def score_kyiv_rus_advanced(slope, aspect, s_prom, s_water):
-    """
-    Комплексна оцінка Київської Русі (Мис + Вода + Сонце + Схил)
-    """
-    # Сонячний схил (Пд-Сх, Пд, Сх)
-    s_sun = 1.0 if 90.0 <= aspect <= 200.0 else (0.6 if 45.0 <= aspect < 90.0 or 200.0 < aspect <= 250.0 else 0.3)
-    # Зручний схил верхнього плато мису
-    s_slope = 1.0 if 2.0 <= slope <= 7.0 else 0.4
+    # Жорсткі критерії КР:
+    # 1. Перепад висоти над водою (12-28 м)
+    s_height = 1.0 if 12.0 <= delta_h <= 28.0 else (0.5 if 8.0 <= delta_h < 12.0 or 28.0 < delta_h <= 40.0 else 0.0)
+    # 2. Відстань до джерела/річки (60-220 м)
+    s_water = 1.0 if 60.0 <= dist_to_water_m <= 220.0 else (0.5 if 220.0 < dist_to_water_m <= 350.0 else 0.0)
+    # 3. Зручність майданчика (1.5° - 6.0°)
+    s_slope = 1.0 if 1.5 <= slope_deg <= 6.0 else 0.3
     
-    # Підсумкова формула (ваги факторів)
-    # Оборонний мис (35%) + Доступність води (35%) + Інсоляція (15%) + Зручність схилу (15%)
-    score = (0.35 * s_prom + 0.35 * s_water + 0.15 * s_sun + 0.15 * s_slope) * 100
-    return round(score, 1)
+    if s_height == 0.0 or s_water == 0.0:
+        return None
+        
+    # Точний підсумковий бал (Ваги: Край мису 35%, Вода 25%, Висота 20%, Сонячність 20%)
+    total_score = (0.35 * tip_score + 0.25 * s_water + 0.20 * s_height + 0.20 * sun_score) * 100
+    
+    return {
+        "lat": 0.0, # заповниться вище
+        "lon": 0.0,
+        "score": round(total_score, 1),
+        "elevation_m": z_center,
+        "delta_h_m": round(delta_h, 1),
+        "dist_water_m": round(dist_to_water_m),
+        "slope_deg": round(slope_deg, 1),
+        "aspect_deg": round(aspect_deg, 1),
+        "sun_score": sun_score,
+        "is_tip": True if tip_score == 1.0 else False
+    }
 
-def filter_local_maxima(results, min_distance_m=150.0):
+def strict_nms_clustering(results, min_distance_m=250.0):
     """
-    Кластеризація: придушення сусідніх точок у радіусі 150 м (NMS).
-    Залишає лише 1 найсильніший маркер на один мис.
+    Жорстке придушення сусідніх точок у радіусі 250 м.
+    Залишає ЛИШЕ 1 еталонну точку на локацію.
     """
     results.sort(key=lambda x: x["score"], reverse=True)
     filtered = []
@@ -112,7 +126,7 @@ def filter_local_maxima(results, min_distance_m=150.0):
             
     return filtered
 
-def run_analysis(lat: float, lon: float, radius_km: float, profile: str):
+def run_analysis(lat: float, lon: float, radius_km: float):
     lat_step, lon_step = 0.00027, 0.00042
     lat_delta = radius_km / 111.0
     lon_delta = radius_km / (111.0 * math.cos(math.radians(lat)))
@@ -138,39 +152,28 @@ def run_analysis(lat: float, lon: float, radius_km: float, profile: str):
     
     for r in range(3, rows - 3):
         for c in range(3, cols - 3):
-            z = grid[r][c]
-            slope, aspect = calc_slope_and_aspect(grid, r, c)
-            s_prom, s_water, delta_h, dist_water = analyze_promontory_and_water(grid, r, c)
-            
-            score = score_kyiv_rus_advanced(slope, aspect, s_prom, s_water)
-            
-            if score >= 65.0:  # Поріг проходження
-                raw_results.append({
-                    "lat": round(lats[r], 5),
-                    "lon": round(lons[c], 5),
-                    "score": score,
-                    "elevation_m": z,
-                    "delta_h_m": round(delta_h, 1),
-                    "dist_water_m": dist_water,
-                    "slope_deg": round(slope, 1)
-                })
+            res = analyze_site_precision(grid, r, c)
+            if res and res["score"] >= 70.0:
+                res["lat"] = round(lats[r], 5)
+                res["lon"] = round(lons[c], 5)
+                raw_results.append(res)
                 
-    # Застосовуємо кластеризацію — прибираємо масиви
-    clean_results = filter_local_maxima(raw_results, min_distance_m=150.0)
-    return clean_results
+    # Застосовуємо жорсткий NMS
+    clean_results = strict_nms_clustering(raw_results, min_distance_m=250.0)
+    return clean_results[:7]  # Видаємо максимум ТОР-7 точкових цілей
 
 @app.get("/")
 def read_root():
     return {"status": "Сервер працює"}
 
 @app.get("/analyze")
-def analyze(lat: float, lon: float, radius_km: float = 1.0, profile: str = "kyiv_rus"):
-    res = run_analysis(lat, lon, radius_km, profile)
-    return {"center": {"lat": lat, "lon": lon}, "total_hotspots": len(res), "top_results": res[:20]}
+def analyze(lat: float, lon: float, radius_km: float = 1.5):
+    res = run_analysis(lat, lon, radius_km)
+    return {"center": {"lat": lat, "lon": lon}, "total_hotspots": len(res), "top_results": res}
 
 @app.get("/map", response_class=HTMLResponse)
-def get_map(lat: float, lon: float, radius_km: float = 1.0, profile: str = "kyiv_rus"):
-    results = run_analysis(lat, lon, radius_km, profile)
+def get_map(lat: float, lon: float, radius_km: float = 1.5):
+    results = run_analysis(lat, lon, radius_km)
     
     m = folium.Map(location=[lat, lon], zoom_start=14, tiles="OpenStreetMap")
     
@@ -180,22 +183,30 @@ def get_map(lat: float, lon: float, radius_km: float = 1.0, profile: str = "kyiv
         icon=folium.Icon(color="black", icon="info-sign")
     ).add_to(m)
     
-    for pt in results:
-        color = "red" if pt["score"] >= 85 else ("orange" if pt["score"] >= 72 else "green")
-        popup_text = (f"<b>Бал КР: {pt['score']}%</b><br>"
-                      f"Висота: {pt['elevation_m']}м<br>"
-                      f"Перепад над водою: {pt['delta_h_m']}м<br>"
-                      f"До води: ~{pt['dist_water_m']}м<br>"
-                      f"Схил: {pt['slope_deg']}°")
+    for idx, pt in enumerate(results, 1):
+        color = "red" if pt["score"] >= 85 else "orange"
+        
+        # Наочна картка точкової цілі
+        popup_html = f"""
+        <div style='font-family: sans-serif; width: 180px;'>
+            <h4 style='margin:0 0 5px 0; color:#d9534f;'>Ціль #{idx} (Бал: {pt['score']}%)</h4>
+            <b>Тип:</b> {'Ніс мису (Край)' if pt['is_tip'] else 'Кромка тераси'}<br>
+            <b>Освітлення:</b> {pt['aspect_deg']}° (Сонце: {int(pt['sun_score']*100)}%)<br>
+            <b>Висота:</b> {pt['elevation_m']} м<br>
+            <b>Перепад:</b> {pt['delta_h_m']} м над низом<br>
+            <b>До води:</b> ~{pt['dist_water_m']} м<br>
+            <b>Схил:</b> {pt['slope_deg']}°
+        </div>
+        """
         
         folium.CircleMarker(
             location=[pt["lat"], pt["lon"]],
-            radius=7,
+            radius=8,
             color=color,
             fill=True,
             fill_color=color,
-            fill_opacity=0.85,
-            popup=popup_text
+            fill_opacity=0.9,
+            popup=folium.Popup(popup_html, max_width=220)
         ).add_to(m)
         
     return m._repr_html_()
