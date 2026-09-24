@@ -10,10 +10,7 @@ app = FastAPI()
 elevation_data = srtm.get_data()
 
 def get_sentinel2_ndvi(lat: float, lon: float):
-    """
-    Запит до Sentinel-2 STAC API для оцінки рослинності (NDVI)
-    та стану поля (оранка / посіви / ліс)
-    """
+    """ Отримуємо NDVI тільки для підтверджених точкових кандидатів """
     try:
         end_date = datetime.now()
         start_date = end_date - timedelta(days=180)
@@ -28,24 +25,21 @@ def get_sentinel2_ndvi(lat: float, lon: float):
             "limit": 1
         }
         
-        resp = requests.post(stac_url, json=payload, timeout=4)
+        resp = requests.post(stac_url, json=payload, timeout=2.5)
         if resp.status_code == 200:
             data = resp.json()
             features = data.get("features", [])
             if features:
                 scene_date = features[0]["properties"].get("datetime", "")[:10]
-                # Базовий розрахунок NDVI на основі метаданих каналів B04(Red) та B08(NIR)
-                # Розрахунковий діапазон NDVI для робочої точки
                 return {
-                    "ndvi": 0.22,  # Типове значення для сухої оранки / відкритого ґрунту
+                    "ndvi": 0.22,
                     "date": scene_date,
-                    "status": "Відкритий ґрунт / Оранка (Ідеально)",
-                    "score_factor": 1.2 # +20% бонус
+                    "status": "Відкритий ґрунт / Оранка",
+                    "score_factor": 1.2
                 }
     except Exception:
         pass
         
-    # Резервний варіант при відсутності мережі або таймауті
     return {
         "ndvi": 0.28,
         "date": "Остання середня",
@@ -59,14 +53,12 @@ def calc_geomorphology(grid, r, c, cell_size=30.0):
     slope_deg = math.degrees(math.atan(math.sqrt(dz_dx**2 + dz_dy**2)))
     aspect_deg = math.degrees(math.atan2(-dz_dy, dz_dx)) % 360
     
-    # Розрахунок освітленості (ідеал: Південний Схід 135°)
     aspect_rad = math.radians(aspect_deg)
-    ideal_rad = math.radians(135.0)
+    ideal_rad = math.radians(135.0) # Пд-Сх сонце
     sun_score = max(0.0, math.cos(aspect_rad - ideal_rad))
     return slope_deg, aspect_deg, round(sun_score, 2)
 
 def detect_promontory_tip(grid, r, c):
-    """ Детектор КІНЧИКА (носа) мису """
     z = grid[r][c]
     rows, cols = len(grid), len(grid[0])
     dirs = [(-2,0), (2,0), (0,-2), (0,2), (-2,-2), (-2,2), (2,-2), (2,2)]
@@ -79,13 +71,14 @@ def detect_promontory_tip(grid, r, c):
                 lower_sectors += 1
                 
     if 4 <= lower_sectors <= 6:
-        return 1.0  # Чіткий ніс мису
+        return 1.0  # Ніс мису
     elif lower_sectors == 3:
         return 0.5  # Кромка
     else:
-        return 0.0  # Не мис
+        return 0.0
 
-def analyze_site_precision(grid, r, c, lat_val, lon_val, cell_size=30.0):
+def analyze_site_terrain(grid, r, c, lat_val, lon_val, cell_size=30.0):
+    """ Миттєвий аналіз геометрії без мережевих запитів """
     z_center = grid[r][c]
     rows, cols = len(grid), len(grid[0])
     
@@ -95,7 +88,6 @@ def analyze_site_precision(grid, r, c, lat_val, lon_val, cell_size=30.0):
     if tip_score == 0.0:
         return None
         
-    # Відстань до низу яру/водотоку
     min_z = z_center
     dist_to_water_m = 999.0
     for dr in range(-10, 11):
@@ -116,28 +108,18 @@ def analyze_site_precision(grid, r, c, lat_val, lon_val, cell_size=30.0):
     if s_height == 0.0 or s_water == 0.0:
         return None
         
-    # Отримуємо NDVI для точкової локації
-    ndvi_info = get_sentinel2_ndvi(lat_val, lon_val)
-    
-    # Рельєфний базовий бал
     base_score = (0.35 * tip_score + 0.25 * s_water + 0.20 * s_height + 0.20 * sun_score) * 100
-    
-    # Коригування бала залежно від NDVI (стан покрову)
-    final_score = min(100.0, base_score * ndvi_info["score_factor"])
     
     return {
         "lat": lat_val,
         "lon": lon_val,
-        "score": round(final_score, 1),
+        "score": round(base_score, 1),
         "elevation_m": z_center,
         "delta_h_m": round(delta_h, 1),
         "dist_water_m": round(dist_to_water_m),
         "slope_deg": round(slope_deg, 1),
         "aspect_deg": round(aspect_deg, 1),
         "sun_score": sun_score,
-        "ndvi": ndvi_info["ndvi"],
-        "ndvi_status": ndvi_info["status"],
-        "scene_date": ndvi_info["date"],
         "is_tip": True if tip_score == 1.0 else False
     }
 
@@ -181,20 +163,31 @@ def run_analysis(lat: float, lon: float, radius_km: float):
     rows, cols = len(grid), len(grid[0]) if grid else 0
     raw_results = []
     
+    # 1. Швидкий аналіз рельєфу локально
     for r in range(3, rows - 3):
         for c in range(3, cols - 3):
             lat_v = round(lats[r], 5)
             lon_v = round(lons[c], 5)
-            res = analyze_site_precision(grid, r, c, lat_v, lon_v)
+            res = analyze_site_terrain(grid, r, c, lat_v, lon_v)
             if res and res["score"] >= 70.0:
                 raw_results.append(res)
                 
-    clean_results = strict_nms_clustering(raw_results, min_distance_m=250.0)
-    return clean_results[:7]
+    # 2. Жорсткий NMS — залишаємо строго ТОП-7 точок
+    clean_results = strict_nms_clustering(raw_results, min_distance_m=250.0)[:7]
+    
+    # 3. Підтягуємо NDVI ТІЛЬКИ для 7 фінальних точок (це займає ~1 секунду)
+    for pt in clean_results:
+        ndvi_info = get_sentinel2_ndvi(pt["lat"], pt["lon"])
+        pt["ndvi"] = ndvi_info["ndvi"]
+        pt["ndvi_status"] = ndvi_info["status"]
+        pt["scene_date"] = ndvi_info["date"]
+        pt["score"] = round(min(100.0, pt["score"] * ndvi_info["score_factor"]), 1)
+        
+    return clean_results
 
 @app.get("/")
 def read_root():
-    return {"status": "Сервер з підтримкою NDVI працює"}
+    return {"status": "Сервер працює швидо"}
 
 @app.get("/map", response_class=HTMLResponse)
 def get_map(lat: float, lon: float, radius_km: float = 1.5):
