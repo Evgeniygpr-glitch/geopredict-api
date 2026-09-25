@@ -1,0 +1,1 @@
+https://geopredict-api.onrender.com/map?lat=50.75&lon=33.47&radius_km=10
