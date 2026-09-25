@@ -1,7 +1,5 @@
 fastapi
 uvicorn
-numpy
-rasterio
-scipy
 folium
+SRTM.py
 requests
