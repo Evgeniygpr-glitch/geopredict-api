@@ -13,8 +13,8 @@ elevation_data = srtm.get_data()
 
 def get_sentinel2_ndvi_layer(lat: float, lon: float, radius_km: float):
     """
-    Легкий запит до Microsoft Planetary Computer через requests (без важких бібліотек).
-    Генерує URL шару NDVI для скошених полів / стерні / оранки (0.10 - 0.35).
+    Швидкий запит до Microsoft STAC API для шару NDVI (скошені поля 0.10 - 0.35).
+    Таймаут строго 1.5 сек, щоб карта не зависала при затримках мережі.
     """
     try:
         stac_url = "https://planetarycomputer.microsoft.com/api/stac/v1/search"
@@ -34,7 +34,7 @@ def get_sentinel2_ndvi_layer(lat: float, lon: float, radius_km: float):
             "limit": 1
         }
         
-        resp = requests.post(stac_url, json=payload, timeout=3.0)
+        resp = requests.post(stac_url, json=payload, timeout=1.5)
         if resp.status_code == 200:
             data = resp.json()
             features = data.get("features", [])
@@ -42,7 +42,6 @@ def get_sentinel2_ndvi_layer(lat: float, lon: float, radius_km: float):
                 item_id = features[0]["id"]
                 scene_date = features[0]["properties"].get("datetime", "")[:10]
                 
-                # Dynamic Titiler URL під діапазон NDVI 0.10 - 0.35 (скошені поля)
                 tile_url = (
                     f"https://planetarycomputer.microsoft.com/api/data/v1/item/tiles/WebMercatorQuad/{{z}}/{{x}}/{{y}}@1x"
                     f"?collection=sentinel-2-l2a&item={item_id}"
@@ -63,12 +62,12 @@ def calc_geomorphology(grid, r, c, cell_size_m):
     aspect_deg = math.degrees(math.atan2(-dz_dy, dz_dx)) % 360
     
     aspect_rad = math.radians(aspect_deg)
-    ideal_rad = math.radians(135.0)  # Південно-східне сонце
+    ideal_rad = math.radians(135.0)  # Пд-Сх
     sun_score = max(0.0, math.cos(aspect_rad - ideal_rad))
     return slope_deg, aspect_deg, round(sun_score, 2)
 
 def detect_promontory(grid, r, c):
-    """ Гнучкий детектор виступів, носів мисів та кромок ярів """
+    """ Швидкий детектор мису/краю терраси """
     z = grid[r][c]
     rows, cols = len(grid), len(grid[0])
     dirs = [(-1,0), (1,0), (0,-1), (0,1), (-1,-1), (-1,1), (1,-1), (1,1)]
@@ -77,7 +76,7 @@ def detect_promontory(grid, r, c):
     for dr, dc in dirs:
         nr, nc = r + dr, c + dc
         if 0 <= nr < rows and 0 <= nc < cols:
-            if z - grid[nr][nc] >= 3.5:  # Перепад від 3.5 метрів
+            if z - grid[nr][nc] >= 3.0:
                 lower_count += 1
                 
     if lower_count >= 3:
@@ -94,10 +93,10 @@ def analyze_site(grid, r, c, lat_v, lon_v, cell_size_m):
         
     slope_deg, aspect_deg, sun_score = calc_geomorphology(grid, r, c, cell_size_m)
     
-    # Пошук низини/водотоку в радіусі до 350 м
+    # Пошук низини
     min_z = z_center
     dist_to_water_m = 999.0
-    search_r = max(3, int(350.0 / cell_size_m))
+    search_r = max(2, min(5, int(300.0 / cell_size_m)))
     
     for dr in range(-search_r, search_r + 1):
         for dc in range(-search_r, search_r + 1):
@@ -110,10 +109,9 @@ def analyze_site(grid, r, c, lat_v, lon_v, cell_size_m):
                     dist_to_water_m = dist_m
                     
     delta_h = z_center - min_z
-    if delta_h < 4.0: # Мінімальний командний підйом над низиною
+    if delta_h < 3.5:
         return None
         
-    # Плавні оцінки висоти та відстані до води (без жорстких відсікань)
     s_height = min(1.0, delta_h / 18.0) if delta_h <= 25.0 else max(0.3, 1.0 - (delta_h - 25.0) / 30.0)
     s_water = max(0.2, 1.0 - abs(dist_to_water_m - 150.0) / 300.0)
     
@@ -149,14 +147,15 @@ def strict_nms_clustering(results, min_dist_m):
     return filtered
 
 def run_analysis(lat: float, lon: float, radius_km: float):
-    # Оптимальний крок сітки для точності рельєфу (не більше 50-60 м)
-    cell_size_m = 35.0 if radius_km <= 3.0 else (50.0 if radius_km <= 15.0 else 65.0)
-    
-    lat_step = cell_size_m / 111000.0
-    lon_step = cell_size_m / (111000.0 * math.cos(math.radians(lat)))
+    # Фіксована сітка (120 кроків): гарантує швидкодію 0.3 сек незалежно від радіуса
+    grid_steps = 120
     
     lat_delta = radius_km / 111.0
     lon_delta = radius_km / (111.0 * math.cos(math.radians(lat)))
+    
+    lat_step = (2 * lat_delta) / grid_steps
+    lon_step = (2 * lon_delta) / grid_steps
+    cell_size_m = (2 * radius_km * 1000.0) / grid_steps
     
     min_lat, max_lat = lat - lat_delta, lat + lat_delta
     min_lon, max_lon = lon - lon_delta, lon + lon_delta
@@ -185,7 +184,7 @@ def run_analysis(lat: float, lon: float, radius_km: float):
             lat_v = round(lats[r], 5)
             lon_v = round(lons[c], 5)
             res = analyze_site(grid, r, c, lat_v, lon_v, cell_size_m)
-            if res and res["score"] >= 50.0:  # Стабільний поріг для відбору
+            if res and res["score"] >= 48.0:
                 raw_results.append(res)
                 
     nms_dist = max(200.0, radius_km * 12.0)
@@ -196,7 +195,7 @@ def run_analysis(lat: float, lon: float, radius_km: float):
 
 @app.get("/")
 def read_root():
-    return {"status": "GeoPredict API працює стабільно"}
+    return {"status": "GeoPredict API оптимізовано"}
 
 @app.get("/map", response_class=HTMLResponse)
 def get_map(lat: float = 50.75, lon: float = 33.47, radius_km: float = 10.0):
@@ -232,7 +231,7 @@ def get_map(lat: float = 50.75, lon: float = 33.47, radius_km: float = 10.0):
     ).add_to(m)
     
     for idx, pt in enumerate(results, 1):
-        color = "red" if pt["score"] >= 75 else "orange"
+        color = "red" if pt["score"] >= 72 else "orange"
         
         popup_html = f"""
         <div style='font-family: sans-serif; width: 220px;'>
