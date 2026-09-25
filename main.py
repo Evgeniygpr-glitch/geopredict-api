@@ -1,872 +1,273 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
-import math
-import os
-import requests
-import folium
 import srtm
+import math
+import folium
+from folium.raster_layers import WmsTileLayer
 
+app = FastAPI()
 
-# =========================================================
-# CONFIG
-# =========================================================
-
-APP_NAME = "GeoPredict"
-VERSION = "0.1.0"
-
-# Ромни
-CENTER_LAT = 50.7460
-CENTER_LON = 33.4747
-
-# Радіус аналізу
-DEFAULT_RADIUS_KM = 30.0
-
-# Sentinel-2
-COPERNICUS_CLIENT_ID = os.getenv(
-    "COPERNICUS_CLIENT_ID"
-)
-
-COPERNICUS_CLIENT_SECRET = os.getenv(
-    "COPERNICUS_CLIENT_SECRET"
-)
-
-# Максимальна хмарність сцени
-MAX_CLOUD_COVER = 10
-
-
-# =========================================================
-# APP
-# =========================================================
-
-app = FastAPI(
-    title=APP_NAME,
-    version=VERSION
-)
-
-
-# =========================================================
-# SRTM
-# =========================================================
-
+# Кешування даних висот SRTM
 elevation_data = srtm.get_data()
 
+def calc_geomorphology(grid, r, c, cell_size_m):
+    dz_dx = (grid[r][c+1] - grid[r][c-1]) / (2 * cell_size_m)
+    dz_dy = (grid[r+1][c] - grid[r-1][c]) / (2 * cell_size_m)
+    slope_deg = math.degrees(math.atan(math.sqrt(dz_dx**2 + dz_dy**2)))
+    aspect_deg = math.degrees(math.atan2(-dz_dy, dz_dx)) % 360
+    
+    aspect_rad = math.radians(aspect_deg)
+    ideal_rad = math.radians(135.0)  # Південно-східний схил для КР
+    sun_score = max(0.0, math.cos(aspect_rad - ideal_rad))
+    return slope_deg, aspect_deg, round(sun_score, 2)
 
-# =========================================================
-# HELPERS
-# =========================================================
-
-def get_bbox(
-    lat: float,
-    lon: float,
-    radius_km: float
-):
+def detect_promontory_kr(grid, r, c):
     """
-    Повертає bounding box навколо точки.
+    Детектор мисових форм рельєфу для Київської Русі.
+    Перевіряє перепад висоти з 3+ сторін.
     """
+    z = grid[r][c]
+    rows, cols = len(grid), len(grid[0])
+    dirs = [(-1,0), (1,0), (0,-1), (0,1), (-1,-1), (-1,1), (1,-1), (1,1)]
+    lower_count = 0
+    max_drop = 0.0
+    
+    for dr, dc in dirs:
+        for step in (1, 2, 3):
+            nr, nc = r + dr * step, c + dc * step
+            if 0 <= nr < rows and 0 <= nc < cols:
+                drop = z - grid[nr][nc]
+                if drop >= 3.5:
+                    lower_count += 1
+                    if drop > max_drop:
+                        max_drop = drop
+                    break
+                
+    if lower_count >= 3 and max_drop >= 4.0:
+        return min(1.0, (lower_count / 8.0) * 0.5 + (max_drop / 15.0) * 0.5)
+    return 0.0
 
-    lat_delta = radius_km / 111.0
-
-    lon_delta = radius_km / (
-        111.0 *
-        math.cos(
-            math.radians(lat)
-        )
-    )
-
+def analyze_site_kr(grid, r, c, lat_v, lon_v, cell_size_m):
+    z_center = grid[r][c]
+    rows, cols = len(grid), len(grid[0])
+    
+    tip_score = detect_promontory_kr(grid, r, c)
+    if tip_score == 0.0:
+        return None
+        
+    slope_deg, aspect_deg, sun_score = calc_geomorphology(grid, r, c, cell_size_m)
+    
+    min_z = z_center
+    dist_to_water_m = 999.0
+    search_r = max(3, min(10, int(450.0 / cell_size_m)))
+    
+    for dr in range(-search_r, search_r + 1):
+        for dc in range(-search_r, search_r + 1):
+            nr, nc = r + dr, c + dc
+            if 0 <= nr < rows and 0 <= nc < cols:
+                val = grid[nr][nc]
+                dist_m = math.sqrt((dr * cell_size_m)**2 + (dc * cell_size_m)**2)
+                if val < min_z:
+                    min_z = val
+                    dist_to_water_m = dist_m
+                    
+    delta_h = z_center - min_z
+    
+    if delta_h < 6.0:
+        return None
+        
+    if 10.0 <= delta_h <= 30.0:
+        s_height = 1.0
+    elif delta_h < 10.0:
+        s_height = delta_h / 10.0
+    else:
+        s_height = max(0.4, 1.0 - (delta_h - 30.0) / 40.0)
+        
+    s_water = max(0.1, 1.0 - abs(dist_to_water_m - 200.0) / 350.0)
+    
+    final_score = (0.45 * tip_score + 0.25 * s_height + 0.20 * s_water + 0.10 * sun_score) * 100
+    
     return {
-        "min_lat": lat - lat_delta,
-        "max_lat": lat + lat_delta,
-        "min_lon": lon - lon_delta,
-        "max_lon": lon + lon_delta
+        "lat": lat_v,
+        "lon": lon_v,
+        "score": round(final_score, 1),
+        "elevation_m": z_center,
+        "delta_h_m": round(delta_h, 1),
+        "dist_water_m": round(dist_to_water_m),
+        "slope_deg": round(slope_deg, 1),
+        "aspect_deg": round(aspect_deg, 1),
+        "sun_score": sun_score,
+        "is_tip": True if tip_score >= 0.65 else False
     }
 
+def strict_nms_clustering(results, min_dist_m):
+    results.sort(key=lambda x: x["score"], reverse=True)
+    filtered = []
+    for pt in results:
+        keep = True
+        for existing in filtered:
+            d_lat = (pt["lat"] - existing["lat"]) * 111000
+            d_lon = (pt["lon"] - existing["lon"]) * 111000 * math.cos(math.radians(pt["lat"]))
+            dist = math.sqrt(d_lat**2 + d_lon**2)
+            if dist < min_dist_m:
+                keep = False
+                break
+        if keep:
+            filtered.append(pt)
+    return filtered
 
-# =========================================================
-# TERRAIN
-# =========================================================
-
-def load_dem(
-    lat: float,
-    lon: float,
-    radius_km: float,
-    steps: int = 180
-):
-    """
-    Завантажує сітку висот SRTM.
-
-    На першому етапі використовуємо SRTM.
-    Пізніше можна замінити джерело DEM.
-    """
-
-    bbox = get_bbox(
-        lat,
-        lon,
-        radius_km
-    )
-
-    min_lat = bbox["min_lat"]
-    max_lat = bbox["max_lat"]
-
-    min_lon = bbox["min_lon"]
-    max_lon = bbox["max_lon"]
-
-    lat_step = (
-        max_lat - min_lat
-    ) / (steps - 1)
-
-    lon_step = (
-        max_lon - min_lon
-    ) / (steps - 1)
-
-    grid = []
-    lats = []
-    lons = []
-
-    for r in range(steps):
-
-        current_lat = (
-            min_lat +
-            r * lat_step
-        )
-
-        lats.append(
-            current_lat
-        )
-
+def run_analysis(lat: float, lon: float, radius_km: float):
+    # Дрібний крок сітки (220 кроків) — висока деталізація та швидкий розрахунок
+    grid_steps = 220
+    
+    lat_delta = radius_km / 111.0
+    lon_delta = radius_km / (111.0 * math.cos(math.radians(lat)))
+    
+    lat_step = (2 * lat_delta) / grid_steps
+    lon_step = (2 * lon_delta) / grid_steps
+    cell_size_m = (2 * radius_km * 1000.0) / grid_steps
+    
+    min_lat, max_lat = lat - lat_delta, lat + lat_delta
+    min_lon, max_lon = lon - lon_delta, lon + lon_delta
+    
+    grid, lats, lons = [], [], []
+    curr_lat = min_lat
+    
+    while curr_lat <= max_lat:
+        lats.append(curr_lat)
         row = []
-
-        for c in range(steps):
-
-            current_lon = (
-                min_lon +
-                c * lon_step
-            )
-
-            if r == 0:
-                lons.append(
-                    current_lon
-                )
-
-            elevation = (
-                elevation_data.get_elevation(
-                    current_lat,
-                    current_lon
-                )
-            )
-
-            row.append(
-                elevation
-            )
-
+        curr_lon = min_lon
+        while curr_lon <= max_lon:
+            if len(lons) < len(row) + 1:
+                lons.append(curr_lon)
+            alt = elevation_data.get_elevation(curr_lat, curr_lon)
+            row.append(alt if alt is not None else 0)
+            curr_lon += lon_step
         grid.append(row)
-
-    return (
-        grid,
-        lats,
-        lons
-    )
-
-
-# =========================================================
-# SLOPE
-# =========================================================
-
-def calculate_slope(
-    grid,
-    r,
-    c,
-    cell_size_m
-):
-    """
-    Розрахунок крутизни схилу.
-    """
-
-    z1 = grid[r][c - 1]
-    z2 = grid[r][c + 1]
-
-    z3 = grid[r - 1][c]
-    z4 = grid[r + 1][c]
-
-    if None in (
-        z1,
-        z2,
-        z3,
-        z4
-    ):
-        return None
-
-    dz_dx = (
-        z2 - z1
-    ) / (
-        2 * cell_size_m
-    )
-
-    dz_dy = (
-        z4 - z3
-    ) / (
-        2 * cell_size_m
-    )
-
-    slope = math.degrees(
-        math.atan(
-            math.sqrt(
-                dz_dx ** 2 +
-                dz_dy ** 2
-            )
-        )
-    )
-
-    return slope
-
-
-# =========================================================
-# ASPECT
-# =========================================================
-
-def calculate_aspect(
-    grid,
-    r,
-    c,
-    cell_size_m
-):
-    """
-    Напрямок схилу.
-    """
-
-    z1 = grid[r][c - 1]
-    z2 = grid[r][c + 1]
-
-    z3 = grid[r - 1][c]
-    z4 = grid[r + 1][c]
-
-    if None in (
-        z1,
-        z2,
-        z3,
-        z4
-    ):
-        return None
-
-    dz_dx = (
-        z2 - z1
-    ) / (
-        2 * cell_size_m
-    )
-
-    dz_dy = (
-        z4 - z3
-    ) / (
-        2 * cell_size_m
-    )
-
-    aspect = (
-        math.degrees(
-            math.atan2(
-                -dz_dy,
-                dz_dx
-            )
-        ) + 360
-    ) % 360
-
-    return aspect
-
-
-# =========================================================
-# CHERNYAKHIV PROFILE
-# =========================================================
-
-CHERNYAKHIV_WEIGHTS = {
-
-    # Малі долини / початки ярів
-    "valley_head": 0.25,
-
-    # Близькість до малих водотоків
-    "small_water": 0.20,
-
-    # Придатність схилу
-    "slope": 0.15,
-
-    # Сонячна експозиція
-    "sun": 0.10,
-
-    # Захист від вітру
-    "wind_shelter": 0.10,
-
-    # Пасовища / відкрита територія
-    "pasture": 0.08,
-
-    # Давні/сучасні дороги
-    "road": 0.05,
-
-    # Відстань до великої річки
-    "large_river": 0.07
-}
-
-
-# =========================================================
-# CHERNYAKHIV SITE SCORE
-# =========================================================
-
-def calculate_chernyakhiv_score(
-    slope,
-    aspect
-):
-    """
-    Поки що базова модель.
-
-    ВАЖЛИВО:
-    реальні valley_head, water, roads,
-    pasture тощо підключимо окремими
-    шарами.
-
-    Тут навмисно НЕ вигадуємо
-    археологічні дані.
-    """
-
-    if slope is None:
-        return 0.0
-
-    # -----------------------------------------------------
-    # SLOPE
-    # -----------------------------------------------------
-    #
-    # Черняхівське поселення:
-    # не вершина і не крутий яр,
-    # а відносно пологий схил.
-    #
-
-    if 2 <= slope <= 8:
-        slope_score = 1.0
-
-    elif slope < 2:
-        slope_score = 0.7
-
-    elif slope <= 12:
-        slope_score = 0.6
-
-    else:
-        slope_score = 0.1
-
-    # -----------------------------------------------------
-    # SUN
-    # -----------------------------------------------------
-
-    if aspect is None:
-        sun_score = 0.5
-
-    else:
-
-        # Південь = 180°
-        # Південний схід = 135°
-        # Південний захід = 225°
-
-        distance = min(
-            abs(aspect - 180),
-            360 - abs(aspect - 180)
-        )
-
-        sun_score = max(
-            0.0,
-            1.0 - distance / 135
-        )
-
-    # -----------------------------------------------------
-    # ПОКИ ЩО ТІЛЬКИ БАЗОВІ ОЗНАКИ
-    # -----------------------------------------------------
-
-    score = (
-        CHERNYAKHIV_WEIGHTS["slope"]
-        * slope_score
-        +
-        CHERNYAKHIV_WEIGHTS["sun"]
-        * sun_score
-    )
-
-    # Переводимо в %
-    return round(
-        score * 100,
-        1
-    )
-
-
-# =========================================================
-# COPERNICUS AUTH
-# =========================================================
-
-def get_copernicus_token():
-    """
-    Отримання OAuth токена Copernicus Data Space.
-
-    Ключі НЕ зберігаємо в коді.
-    На Render вони будуть Environment Variables.
-    """
-
-    if not (
-        COPERNICUS_CLIENT_ID
-        and
-        COPERNICUS_CLIENT_SECRET
-    ):
-        return None
-
-    url = (
-        "https://identity.dataspace.copernicus.eu/"
-        "auth/realms/CDSE/"
-        "protocol/openid-connect/token"
-    )
-
-    data = {
-        "grant_type": "client_credentials",
-        "client_id": COPERNICUS_CLIENT_ID,
-        "client_secret": COPERNICUS_CLIENT_SECRET
-    }
-
-    response = requests.post(
-        url,
-        data=data,
-        timeout=30
-    )
-
-    response.raise_for_status()
-
-    return response.json()[
-        "access_token"
-    ]
-
-
-# =========================================================
-# COPERNICUS SEARCH
-# =========================================================
-
-def search_sentinel2(
-    lat,
-    lon,
-    radius_km=30,
-    max_cloud=10
-):
-    """
-    Пошук Sentinel-2 L2A сцен.
-
-    Повертає метадані доступних знімків.
-
-    Поки що НЕ завантажуємо весь знімок.
-    """
-
-    token = get_copernicus_token()
-
-    if token is None:
-        return {
-            "enabled": False,
-            "message": (
-                "Copernicus credentials "
-                "не налаштовані"
-            )
-        }
-
-    bbox = get_bbox(
-        lat,
-        lon,
-        radius_km
-    )
-
-    url = (
-        "https://sh.dataspace.copernicus.eu/"
-        "catalog/v1/search"
-    )
-
-    headers = {
-        "Authorization":
-            f"Bearer {token}",
-        "Content-Type":
-            "application/json"
-    }
-
-    payload = {
-
-        "collections": [
-            "sentinel-2-l2a"
-        ],
-
-        "datetime":
-            "2026-04-01T00:00:00Z/"
-            "2026-09-30T23:59:59Z",
-
-        "bbox": [
-            bbox["min_lon"],
-            bbox["min_lat"],
-            bbox["max_lon"],
-            bbox["max_lat"]
-        ],
-
-        "limit": 20,
-
-        "filter": {
-            "op": "<=",
-            "args": [
-                {
-                    "property":
-                        "eo:cloud_cover"
-                },
-                max_cloud
-            ]
-        }
-    }
-
-    response = requests.post(
-        url,
-        headers=headers,
-        json=payload,
-        timeout=60
-    )
-
-    response.raise_for_status()
-
-    return response.json()
-
-
-# =========================================================
-# API: STATUS
-# =========================================================
+        curr_lat += lat_step
+        
+    rows, cols = len(grid), len(grid[0]) if grid else 0
+    raw_results = []
+    
+    for r in range(3, rows - 3):
+        for c in range(3, cols - 3):
+            lat_v = round(lats[r], 5)
+            lon_v = round(lons[c], 5)
+            res = analyze_site_kr(grid, r, c, lat_v, lon_v, cell_size_m)
+            if res and res["score"] >= 42.0:
+                raw_results.append(res)
+                
+    clean_results = strict_nms_clustering(raw_results, min_dist_m=130.0)
+    
+    limit = 35 if radius_km >= 10 else 20
+    return clean_results[:limit]
 
 @app.get("/")
-def root():
+def read_root():
+    return {"status": "GeoPredict API (КР + WMS NDVI) працює"}
 
-    return {
-        "status": "ok",
-        "service": APP_NAME,
-        "version": VERSION,
-        "center": {
-            "lat": CENTER_LAT,
-            "lon": CENTER_LON
-        },
-        "radius_km":
-            DEFAULT_RADIUS_KM
-    }
-
-
-# =========================================================
-# API: TERRAIN
-# =========================================================
-
-@app.get("/api/analyze")
-def analyze(
-    lat: float = CENTER_LAT,
-    lon: float = CENTER_LON,
-    radius_km: float = DEFAULT_RADIUS_KM
-):
-
-    if radius_km <= 0:
-        raise HTTPException(
-            400,
-            "radius_km має бути > 0"
-        )
-
-    if radius_km > 100:
-        raise HTTPException(
-            400,
-            "Максимальний радіус зараз 100 км"
-        )
-
-    grid, lats, lons = load_dem(
-        lat,
-        lon,
-        radius_km
-    )
-
-    rows = len(grid)
-    cols = len(grid[0])
-
-    # Приблизний розмір клітини
-    cell_size_m = (
-        radius_km * 2000
-    ) / (rows - 1)
-
-    results = []
-
-    for r in range(
-        1,
-        rows - 1
-    ):
-
-        for c in range(
-            1,
-            cols - 1
-        ):
-
-            if grid[r][c] is None:
-                continue
-
-            slope = calculate_slope(
-                grid,
-                r,
-                c,
-                cell_size_m
-            )
-
-            aspect = calculate_aspect(
-                grid,
-                r,
-                c,
-                cell_size_m
-            )
-
-            score = (
-                calculate_chernyakhiv_score(
-                    slope,
-                    aspect
-                )
-            )
-
-            # Поки не віддаємо всі 32 000 точок
-            if score >= 8:
-
-                results.append({
-                    "lat":
-                        round(
-                            lats[r],
-                            5
-                        ),
-
-                    "lon":
-                        round(
-                            lons[c],
-                            5
-                        ),
-
-                    "score":
-                        score,
-
-                    "elevation_m":
-                        round(
-                            grid[r][c],
-                            1
-                        ),
-
-                    "slope_deg":
-                        round(
-                            slope,
-                            1
-                        )
-                        if slope is not None
-                        else None,
-
-                    "aspect_deg":
-                        round(
-                            aspect,
-                            1
-                        )
-                        if aspect is not None
-                        else None
-                })
-
-    results.sort(
-        key=lambda x:
-            x["score"],
-        reverse=True
-    )
-
-    return {
-        "center": {
-            "lat": lat,
-            "lon": lon
-        },
-
-        "radius_km":
-            radius_km,
-
-        "profile":
-            "chernyakhiv",
-
-        "count":
-            len(results),
-
-        "results":
-            results[:500]
-    }
-
-
-# =========================================================
-# API: COPERNICUS
-# =========================================================
-
-@app.get("/api/sentinel")
-def sentinel(
-    lat: float = CENTER_LAT,
-    lon: float = CENTER_LON,
-    radius_km: float = DEFAULT_RADIUS_KM
-):
-
-    try:
-
-        return search_sentinel2(
-            lat,
-            lon,
-            radius_km,
-            MAX_CLOUD_COVER
-        )
-
-    except Exception as error:
-
-        raise HTTPException(
-            500,
-            f"Copernicus error: {error}"
-        )
-
-
-# =========================================================
-# DEBUG MAP
-# =========================================================
-
-@app.get(
-    "/map",
-    response_class=HTMLResponse
-)
-def map_view(
-    lat: float = CENTER_LAT,
-    lon: float = CENTER_LON,
-    radius_km: float = DEFAULT_RADIUS_KM
-):
-
-    # -----------------------------------------------------
-    # Аналіз
-    # -----------------------------------------------------
-
-    data = analyze(
-        lat,
-        lon,
-        radius_km
-    )
-
-    results = data["results"]
-
-    # -----------------------------------------------------
-    # MAP
-    # -----------------------------------------------------
-
+@app.get("/map", response_class=HTMLResponse)
+def get_map(lat: float = 50.75, lon: float = 33.47, radius_km: float = 10.0):
+    # 1. Пошук точок КР за рельєфом
+    results = run_analysis(lat, lon, radius_km)
+    
+    # 2. Ініціалізація карти з основним шаром Esri Satellite HD
     m = folium.Map(
-        location=[
-            lat,
-            lon
-        ],
-        zoom_start=11,
-        tiles=None
+        location=[lat, lon],
+        zoom_start=12 if radius_km > 10 else 14,
+        tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+        attr="Esri World Imagery",
+        name="🌍 Супутник HD (Esri)"
     )
-
-    # -----------------------------------------------------
-    # SATELLITE
-    # -----------------------------------------------------
-
+    
+    # 3. Шар Google Hybrid (Супутник з назвами доріг, населених пунктів та річок)
     folium.TileLayer(
-        tiles=(
-            "https://server.arcgisonline.com/"
-            "ArcGIS/rest/services/"
-            "World_Imagery/MapServer/tile/"
-            "{z}/{y}/{x}"
-        ),
-        attr="Esri",
-        name="Супутник"
+        tiles="https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}",
+        attr="Google Maps",
+        name="🛰️ Google Hybrid (з назвами)"
+    ).add_to(m)
+    
+    # 4. Топографічна карта Esri
+    folium.TileLayer(
+        tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Topo_Map/MapServer/tile/{z}/{y}/{x}",
+        attr="Esri World Topo",
+        name="🗺️ Топо-карта (Esri Topo)"
+    ).add_to(m)
+    
+    # 5. Шар NDVI (Індекс рослинності NASA MODIS)
+    WmsTileLayer(
+        url="https://gibs.earthdata.nasa.gov/wms/epsg3857/best/wms.cgi",
+        layers="MODIS_Terra_NDVI_8Day",
+        name="🌱 NDVI Індекс рослинності (NASA)",
+        fmt="image/png",
+        transparent=True,
+        overlay=True,
+        opacity=0.6,
+        attr="NASA GIBS / EOSDIS"
     ).add_to(m)
 
-    # -----------------------------------------------------
-    # TOPO
-    # -----------------------------------------------------
-
-    folium.TileLayer(
-        tiles=(
-            "https://server.arcgisonline.com/"
-            "ArcGIS/rest/services/"
-            "World_Topo_Map/MapServer/tile/"
-            "{z}/{y}/{x}"
-        ),
-        attr="Esri",
-        name="Топографічна карта"
+    # 6. Шар False Color (Bands 7-2-1) для контрасту зораних / скошених полів
+    WmsTileLayer(
+        url="https://gibs.earthdata.nasa.gov/wms/epsg3857/best/wms.cgi",
+        layers="MODIS_Terra_CorrectedReflectance_Bands721",
+        name="🌾 Контраст полів (False Color 7-2-1)",
+        fmt="image/jpeg",
+        transparent=False,
+        overlay=True,
+        opacity=0.65,
+        attr="NASA GIBS / EOSDIS"
     ).add_to(m)
-
-    # -----------------------------------------------------
-    # ANALYSIS AREA
-    # -----------------------------------------------------
-
+    
+    # 7. Контур радіуса аналізу
     folium.Circle(
-        location=[
-            lat,
-            lon
-        ],
+        location=[lat, lon],
         radius=radius_km * 1000,
-        color="blue",
-        fill=False,
+        color="#e74c3c",
         weight=2,
-        popup=(
-            f"Зона аналізу: "
-            f"{radius_km} км"
-        )
+        fill=True,
+        fill_color="#e74c3c",
+        fill_opacity=0.08,
+        popup=f"Зона аналізу: {radius_km} км",
+        tooltip=f"Радіус аналізу {radius_km} км"
     ).add_to(m)
 
-    # -----------------------------------------------------
-    # CENTER
-    # -----------------------------------------------------
-
+    # 8. Центральна маркерна мітка
     folium.Marker(
-        [
-            lat,
-            lon
-        ],
-        popup="Центр аналізу — Ромни"
+        [lat, lon],
+        popup=f"Центр аналізу КР ({lat:.5f}, {lon:.5f})",
+        icon=folium.Icon(color="black", icon="info-sign")
     ).add_to(m)
-
-    # -----------------------------------------------------
-    # CANDIDATES
-    # -----------------------------------------------------
-
-    for index, point in enumerate(
-        results[:150],
-        1
-    ):
-
-        score = point["score"]
-
-        if score >= 35:
-            color = "red"
-
-        elif score >= 20:
-            color = "orange"
-
+    
+    # 9. Нанесення знайдених потенційних об'єктів КР
+    for idx, pt in enumerate(results, 1):
+        if pt["score"] >= 68:
+            color = "red"        # Оборонне городище КР / виражений мис
+        elif pt["score"] >= 52:
+            color = "orange"     # Мисове селище КР
         else:
-            color = "blue"
-
-        popup = f"""
-        <b>Кандидат #{index}</b><br>
-        Черняхівський score:
-        {score}%<br>
-        Висота:
-        {point['elevation_m']} м<br>
-        Схил:
-        {point['slope_deg']}°<br>
-        Експозиція:
-        {point['aspect_deg']}°
+            color = "darkblue"   # Перспективна тераса
+        
+        popup_html = f"""
+        <div style='font-family: sans-serif; width: 230px;'>
+            <h4 style='margin:0 0 5px 0; color:#d9534f;'>Ціль КР #{idx} (Бал: {pt['score']}%)</h4>
+            <b>Тип:</b> {'Оборонний мис (Городище)' if pt['is_tip'] else 'Терасове селище'}<br>
+            <b>Висота над низиною:</b> +{pt['delta_h_m']} м<br>
+            <b>Абс. висота:</b> {pt['elevation_m']} м<br>
+            <b>До річки/заплави:</b> ~{pt['dist_water_m']} м<br>
+            <b>Схил / Сонце:</b> {pt['aspect_deg']}° ({int(pt['sun_score']*100)}%)
+        </div>
         """
-
+        
         folium.CircleMarker(
-            location=[
-                point["lat"],
-                point["lon"]
-            ],
-            radius=5,
+            location=[pt["lat"], pt["lon"]],
+            radius=7 if radius_km > 10 else 9,
             color=color,
             fill=True,
             fill_color=color,
-            fill_opacity=0.7,
-            popup=folium.Popup(
-                popup,
-                max_width=250
-            )
+            fill_opacity=0.9,
+            popup=folium.Popup(popup_html, max_width=260)
         ).add_to(m)
-
-    # -----------------------------------------------------
-    # LAYER CONTROL
-    # -----------------------------------------------------
-
-    folium.LayerControl(
-        collapsed=False
-    ).add_to(m)
-
+        
+    # Панель перемикання шарів у верхньому правому кутку
+    folium.LayerControl(collapsed=False).add_to(m)
     return m._repr_html_()
-```
