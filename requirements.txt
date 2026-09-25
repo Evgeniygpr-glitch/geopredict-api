@@ -1,4 +1,7 @@
 fastapi
 uvicorn
 folium
+requests
 srtm.py
+pystac-client
+planetary-computer
