@@ -3,50 +3,11 @@ from fastapi.responses import HTMLResponse
 import srtm
 import math
 import folium
-import requests
-from datetime import datetime, timedelta
 
 app = FastAPI()
 
 # Кешування даних висот SRTM
 elevation_data = srtm.get_data()
-
-def get_copernicus_s2_ndvi_layer(lat: float, lon: float, radius_km: float):
-    """
-    Прямий запит до Copernicus STAC API з жорстким таймаутом (1.8 сек),
-    щоб карта завантажувалася без затримок.
-    """
-    scene_date = "Copernicus"
-    try:
-        stac_url = "https://stac.dataspace.copernicus.eu/v1/search"
-        end_date = datetime.now()
-        start_date = end_date - timedelta(days=120)
-        
-        lat_delta = radius_km / 111.0
-        lon_delta = radius_km / (111.0 * math.cos(math.radians(lat)))
-        bbox = [lon - lon_delta, lat - lat_delta, lon + lon_delta, lat + lat_delta]
-        
-        payload = {
-            "collections": ["SENTINEL-2"],
-            "bbox": bbox,
-            "datetime": f"{start_date.strftime('%Y-%m-%d')}T00:00:00Z/{end_date.strftime('%Y-%m-%d')}T23:59:59Z",
-            "filter-lang": "cql2-text",
-            "filter": "eo:cloud_cover < 25",
-            "limit": 1
-        }
-        
-        headers = {"Content-Type": "application/json"}
-        resp = requests.post(stac_url, json=payload, headers=headers, timeout=1.8)
-        
-        if resp.status_code == 200:
-            data = resp.json()
-            features = data.get("features", [])
-            if features:
-                scene_date = features[0]["properties"].get("datetime", "")[:10]
-    except Exception:
-        pass
-        
-    return scene_date
 
 def calc_geomorphology(grid, r, c, cell_size_m):
     dz_dx = (grid[r][c+1] - grid[r][c-1]) / (2 * cell_size_m)
@@ -155,7 +116,7 @@ def strict_nms_clustering(results, min_dist_m):
     return filtered
 
 def run_analysis(lat: float, lon: float, radius_km: float):
-    # Дрібний крок сітки (220 кроків) — відмінна деталізація та швидке завантаження
+    # Дрібний крок сітки (220 кроків) — відмінна деталізація та миттєвий результат
     grid_steps = 220
     
     lat_delta = radius_km / 111.0
@@ -207,9 +168,8 @@ def read_root():
 @app.get("/map", response_class=HTMLResponse)
 def get_map(lat: float = 50.75, lon: float = 33.47, radius_km: float = 10.0):
     results = run_analysis(lat, lon, radius_km)
-    scene_date = get_copernicus_s2_ndvi_layer(lat, lon, radius_km)
     
-    # Створення карти з основним шаром Esri Satellite (швидкі сервери без зависань)
+    # Карта відкривається миттєво з використанням надшвидкісних CDN
     m = folium.Map(
         location=[lat, lon],
         zoom_start=12 if radius_km > 10 else 14,
@@ -218,20 +178,18 @@ def get_map(lat: float = 50.75, lon: float = 33.47, radius_km: float = 10.0):
         name="🌍 Супутник HD (Esri)"
     )
     
-    # Швидка альтернативна топо-карта замість OSM
+    # Шар Google Hybrid (Супутник з назвами доріг та річок)
+    folium.TileLayer(
+        tiles="https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}",
+        attr="Google",
+        name="🛰️ Google Hybrid (Супутник + Назви)"
+    ).add_to(m)
+    
+    # Швидка топо-карта
     folium.TileLayer(
         tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Topo_Map/MapServer/tile/{z}/{y}/{x}",
         attr="Esri World Topo",
         name="🗺️ Топо-карта (Esri Topo)"
-    ).add_to(m)
-    
-    # Шар Copernicus Data Space
-    folium.TileLayer(
-        tiles="https://datacenter.copernicus.eu/tiles/s2/{z}/{x}/{y}.png",
-        attr="Copernicus Data Space Ecosystem",
-        name=f"🇪🇺 Copernicus Sentinel-2 ({scene_date})",
-        overlay=True,
-        opacity=0.55
     ).add_to(m)
     
     folium.Marker(
@@ -242,9 +200,9 @@ def get_map(lat: float = 50.75, lon: float = 33.47, radius_km: float = 10.0):
     
     for idx, pt in enumerate(results, 1):
         if pt["score"] >= 68:
-            color = "red"        # Оборонне городище КР / виражений мис
+            color = "red"        # Висока ймовірність (Оборонне городище КР)
         elif pt["score"] >= 52:
-            color = "orange"     # Мисове селище КР
+            color = "orange"     # Середня ймовірність (Мисове селище КР)
         else:
             color = "darkblue"   # Перспективна тераса
         
