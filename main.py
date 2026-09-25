@@ -13,13 +13,14 @@ elevation_data = srtm.get_data()
 
 def get_copernicus_s2_ndvi_layer(lat: float, lon: float, radius_km: float):
     """
-    Прямий запит до Copernicus Data Space Ecosystem (CDSE) STAC API
-    для отримання актуальних знімків Sentinel-2 L2A.
+    Прямий запит до Copernicus STAC API з жорстким таймаутом (1.8 сек),
+    щоб карта завантажувалася без затримок.
     """
+    scene_date = "Copernicus"
     try:
         stac_url = "https://stac.dataspace.copernicus.eu/v1/search"
         end_date = datetime.now()
-        start_date = end_date - timedelta(days=150)
+        start_date = end_date - timedelta(days=120)
         
         lat_delta = radius_km / 111.0
         lon_delta = radius_km / (111.0 * math.cos(math.radians(lat)))
@@ -35,28 +36,17 @@ def get_copernicus_s2_ndvi_layer(lat: float, lon: float, radius_km: float):
         }
         
         headers = {"Content-Type": "application/json"}
-        resp = requests.post(stac_url, json=payload, headers=headers, timeout=3.5)
+        resp = requests.post(stac_url, json=payload, headers=headers, timeout=1.8)
         
-        scene_date = "Copernicus"
         if resp.status_code == 200:
             data = resp.json()
             features = data.get("features", [])
             if features:
                 scene_date = features[0]["properties"].get("datetime", "")[:10]
-
-        # WMS шар Copernicus Data Space Ecosystem для NDVI / Sentinel-2
-        copernicus_wms_url = (
-            "https://sh.dataspace.copernicus.eu/ogc/wms/109312b9-2c0d-408a-a4e8-8b96e479c83f"
-            "?SERVICE=WMS&REQUEST=GetMap&LAYERS=NDVI"
-            "&MAXCC=20&WIDTH=512&HEIGHT=512&FORMAT=image/png"
-            "&TIME=" + start_date.strftime("%Y-%m-%d") + "/" + end_date.strftime("%Y-%m-%d") +
-            "&BBOX={bbox}"
-        )
-        return copernicus_wms_url, scene_date
     except Exception:
         pass
         
-    return None, None
+    return scene_date
 
 def calc_geomorphology(grid, r, c, cell_size_m):
     dz_dx = (grid[r][c+1] - grid[r][c-1]) / (2 * cell_size_m)
@@ -71,8 +61,8 @@ def calc_geomorphology(grid, r, c, cell_size_m):
 
 def detect_promontory_kr(grid, r, c):
     """
-    Детектор мисових форм рельєфу спеціально для Київської Русі.
-    Перевіряє наявність крутого схилу/падіння з 3+ сторін.
+    Детектор мисових форм рельєфу для Київської Русі.
+    Перевіряє перепад висоти з 3+ сторін.
     """
     z = grid[r][c]
     rows, cols = len(grid), len(grid[0])
@@ -85,7 +75,7 @@ def detect_promontory_kr(grid, r, c):
             nr, nc = r + dr * step, c + dc * step
             if 0 <= nr < rows and 0 <= nc < cols:
                 drop = z - grid[nr][nc]
-                if drop >= 3.5: # Вимога для КР: крутий перепад від 3.5 м
+                if drop >= 3.5:
                     lower_count += 1
                     if drop > max_drop:
                         max_drop = drop
@@ -96,9 +86,6 @@ def detect_promontory_kr(grid, r, c):
     return 0.0
 
 def analyze_site_kr(grid, r, c, lat_v, lon_v, cell_size_m):
-    """
-    Спеціалізована функція оцінки пам'яток Київської Русі (КР)
-    """
     z_center = grid[r][c]
     rows, cols = len(grid), len(grid[0])
     
@@ -108,7 +95,6 @@ def analyze_site_kr(grid, r, c, lat_v, lon_v, cell_size_m):
         
     slope_deg, aspect_deg, sun_score = calc_geomorphology(grid, r, c, cell_size_m)
     
-    # Пошук низини (заплава річки / струмок)
     min_z = z_center
     dist_to_water_m = 999.0
     search_r = max(3, min(10, int(450.0 / cell_size_m)))
@@ -125,11 +111,9 @@ def analyze_site_kr(grid, r, c, lat_v, lon_v, cell_size_m):
                     
     delta_h = z_center - min_z
     
-    # Для КР критична висота над низиною (мінімум 6 метрів)
     if delta_h < 6.0:
         return None
         
-    # Ідеальний перепад висоти для городищ/селищ КР: 12-28 метрів
     if 10.0 <= delta_h <= 30.0:
         s_height = 1.0
     elif delta_h < 10.0:
@@ -137,10 +121,8 @@ def analyze_site_kr(grid, r, c, lat_v, lon_v, cell_size_m):
     else:
         s_height = max(0.4, 1.0 - (delta_h - 30.0) / 40.0)
         
-    # Дистанція до води для КР: ідеально 100 - 300 метрів
     s_water = max(0.1, 1.0 - abs(dist_to_water_m - 200.0) / 350.0)
     
-    # Скоригована формула вагових коефіцієнтів для Київської Русі
     final_score = (0.45 * tip_score + 0.25 * s_height + 0.20 * s_water + 0.10 * sun_score) * 100
     
     return {
@@ -173,8 +155,8 @@ def strict_nms_clustering(results, min_dist_m):
     return filtered
 
 def run_analysis(lat: float, lon: float, radius_km: float):
-    # Дрібний крок сітки (300 кроків): роздільна здатність ~25-40 метрів
-    grid_steps = 300
+    # Дрібний крок сітки (220 кроків) — відмінна деталізація та швидке завантаження
+    grid_steps = 220
     
     lat_delta = radius_km / 111.0
     lon_delta = radius_km / (111.0 * math.cos(math.radians(lat)))
@@ -213,41 +195,43 @@ def run_analysis(lat: float, lon: float, radius_km: float):
             if res and res["score"] >= 42.0:
                 raw_results.append(res)
                 
-    # Кластеризація (придшушення сусідніх точок ближче 120 м)
-    clean_results = strict_nms_clustering(raw_results, min_dist_m=120.0)
+    clean_results = strict_nms_clustering(raw_results, min_dist_m=130.0)
     
-    limit = 40 if radius_km >= 10 else 20
+    limit = 35 if radius_km >= 10 else 20
     return clean_results[:limit]
 
 @app.get("/")
 def read_root():
-    return {"status": "GeoPredict API (Спеціалізація: Київська Русь) працює"}
+    return {"status": "GeoPredict API (КР) працює"}
 
 @app.get("/map", response_class=HTMLResponse)
 def get_map(lat: float = 50.75, lon: float = 33.47, radius_km: float = 10.0):
-    # 1. Пошук кращих об'єктів Київської Русі
     results = run_analysis(lat, lon, radius_km)
+    scene_date = get_copernicus_s2_ndvi_layer(lat, lon, radius_km)
     
-    # 2. Отримання шару з Copernicus Data Space Ecosystem
-    copernicus_wms_url, scene_date = get_copernicus_s2_ndvi_layer(lat, lon, radius_km)
-    
-    # 3. Створення карти
-    m = folium.Map(location=[lat, lon], zoom_start=12 if radius_km > 10 else 14, tiles=None)
-    
-    folium.TileLayer("OpenStreetMap", name="Топо-карта (OSM)").add_to(m)
-    folium.TileLayer(
+    # Створення карти з основним шаром Esri Satellite (швидкі сервери без зависань)
+    m = folium.Map(
+        location=[lat, lon],
+        zoom_start=12 if radius_km > 10 else 14,
         tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
         attr="Esri World Imagery",
-        name="Супутник HD (Esri)"
+        name="🌍 Супутник HD (Esri)"
+    )
+    
+    # Швидка альтернативна топо-карта замість OSM
+    folium.TileLayer(
+        tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Topo_Map/MapServer/tile/{z}/{y}/{x}",
+        attr="Esri World Topo",
+        name="🗺️ Топо-карта (Esri Topo)"
     ).add_to(m)
     
-    # Додавання Copernicus Sentinel-2
+    # Шар Copernicus Data Space
     folium.TileLayer(
         tiles="https://datacenter.copernicus.eu/tiles/s2/{z}/{x}/{y}.png",
         attr="Copernicus Data Space Ecosystem",
         name=f"🇪🇺 Copernicus Sentinel-2 ({scene_date})",
         overlay=True,
-        opacity=0.60
+        opacity=0.55
     ).add_to(m)
     
     folium.Marker(
@@ -258,9 +242,9 @@ def get_map(lat: float = 50.75, lon: float = 33.47, radius_km: float = 10.0):
     
     for idx, pt in enumerate(results, 1):
         if pt["score"] >= 68:
-            color = "red"        # Висока ймовірність (Городище / Виражений мис КР)
+            color = "red"        # Оборонне городище КР / виражений мис
         elif pt["score"] >= 52:
-            color = "orange"     # Середня ймовірність (Мисове селище КР)
+            color = "orange"     # Мисове селище КР
         else:
             color = "darkblue"   # Перспективна тераса
         
