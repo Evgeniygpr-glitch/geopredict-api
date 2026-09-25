@@ -66,7 +66,7 @@ def calc_geomorphology(grid: np.ndarray, r: int, c: int, cell_size_m: float):
 
 def detect_promontory_kr(grid: np.ndarray, r: int, c: int) -> float:
     """Детектор мисових форм рельєфу: перепад висоти з 3+ сторін."""
-    z = grid[r, c]
+    z = float(grid[r, c])  # явний python float — інакше numpy.float32 "протікає" далі і ламає JSON-серіалізацію
     rows, cols = grid.shape
     dirs = [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (-1, 1), (1, -1), (1, 1)]
     lower_count = 0
@@ -76,7 +76,7 @@ def detect_promontory_kr(grid: np.ndarray, r: int, c: int) -> float:
         for step in (1, 2, 3):
             nr, nc = r + dr * step, c + dc * step
             if 0 <= nr < rows and 0 <= nc < cols:
-                drop = z - grid[nr, nc]
+                drop = z - float(grid[nr, nc])
                 if drop >= 3.5:
                     lower_count += 1
                     max_drop = max(max_drop, drop)
@@ -132,17 +132,20 @@ def analyze_site_kr(grid: np.ndarray, r: int, c: int, lat_v: float, lon_v: float
 
     final_score = (0.45 * tip_score + 0.25 * s_height + 0.20 * s_water + 0.10 * sun_score) * 100
 
+    # Явні float()/bool()/int() — запобіжник від numpy-скалярів (numpy.float32/np.bool_
+    # не серіалізуються в JSON і викликають 500 Internal Server Error), незалежно від
+    # того, звідки саме вище по коду міг "протекти" numpy-тип.
     return {
-        "lat": lat_v,
-        "lon": lon_v,
-        "score": round(final_score, 1),
-        "elevation_m": round(z_center, 1),
-        "delta_h_m": round(delta_h, 1),
-        "dist_water_m": round(dist_to_water_m),
-        "slope_deg": round(slope_deg, 1),
-        "aspect_deg": round(aspect_deg, 1),
-        "sun_score": sun_score,
-        "is_tip": tip_score >= 0.65,
+        "lat": float(lat_v),
+        "lon": float(lon_v),
+        "score": round(float(final_score), 1),
+        "elevation_m": round(float(z_center), 1),
+        "delta_h_m": round(float(delta_h), 1),
+        "dist_water_m": int(round(float(dist_to_water_m))),
+        "slope_deg": round(float(slope_deg), 1),
+        "aspect_deg": round(float(aspect_deg), 1),
+        "sun_score": float(sun_score),
+        "is_tip": bool(tip_score >= 0.65),
     }
 
 
