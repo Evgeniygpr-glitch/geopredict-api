@@ -21,11 +21,16 @@ os.environ.setdefault("SRTM1_DIR", "/tmp/srtm_data")
 os.environ.setdefault("SRTM3_DIR", "/tmp/srtm_data")
 os.makedirs("/tmp/srtm_data", exist_ok=True)
 
-MAX_RADIUS_KM = 20.0
+MAX_RADIUS_KM = 50.0
 MIN_RADIUS_KM = 0.5
 TARGET_CELL_M = 35.0   # цільовий розмір клітинки сітки (SRTM ~30м/піксель)
 MIN_GRID_STEPS = 40
 MAX_GRID_STEPS = 160    # жорсткий стеля, щоб запит завжди встигав у таймаут Render
+
+# Опційна інтеграція Copernicus Data Space (Sentinel Hub) для чіткого NDVI (10 м/піксель).
+# Якщо змінна не задана — використовується запасний шар NASA GIBS MODIS NDVI (250-500 м/піксель,
+# помітно грубіший, зате не вимагає реєстрації).
+COPERNICUS_INSTANCE_ID = os.environ.get("COPERNICUS_INSTANCE_ID", "").strip()
 
 app = FastAPI(title="GeoPredict API (КР + WMS NDVI)")
 
@@ -222,6 +227,70 @@ def read_root():
     return {"status": "GeoPredict API (КР + WMS NDVI) працює"}
 
 
+@app.get("/test", response_class=HTMLResponse)
+def test_form():
+    """
+    Проста сторінка з формою: вводите lat/lon/radius_km один раз,
+    а посилання на /map та /api/analyze збираються самі — не треба
+    вручну дописувати ?lat=...&lon=...&radius_km=... в адресний рядок.
+    """
+    return """
+    <!DOCTYPE html>
+    <html lang="uk">
+    <head>
+        <meta charset="utf-8">
+        <title>GeoPredict — тест</title>
+        <style>
+            body { font-family: sans-serif; max-width: 480px; margin: 40px auto; padding: 0 16px; }
+            label { display: block; margin-top: 14px; font-weight: bold; }
+            input { width: 100%; padding: 8px; box-sizing: border-box; font-size: 16px; }
+            .row { display: flex; gap: 10px; margin-top: 20px; }
+            a.btn {
+                flex: 1; text-align: center; padding: 12px; border-radius: 6px;
+                text-decoration: none; color: white; font-weight: bold;
+            }
+            .btn-map { background: #2c7be5; }
+            .btn-json { background: #2f9e44; }
+        </style>
+    </head>
+    <body>
+        <h2>GeoPredict — швидкий тест</h2>
+
+        <label for="lat">Широта (lat)</label>
+        <input id="lat" type="number" step="0.00001" value="50.75">
+
+        <label for="lon">Довгота (lon)</label>
+        <input id="lon" type="number" step="0.00001" value="33.47">
+
+        <label for="radius">Радіус (км)</label>
+        <input id="radius" type="number" step="0.5" min="0.5" max="20" value="5">
+
+        <div class="row">
+            <a class="btn btn-map" id="mapLink" href="#" target="_blank">Відкрити карту</a>
+            <a class="btn btn-json" id="jsonLink" href="#" target="_blank">Відкрити JSON</a>
+        </div>
+
+        <script>
+            const latEl = document.getElementById('lat');
+            const lonEl = document.getElementById('lon');
+            const radEl = document.getElementById('radius');
+            const mapLink = document.getElementById('mapLink');
+            const jsonLink = document.getElementById('jsonLink');
+
+            function updateLinks() {
+                const q = `lat=${latEl.value}&lon=${lonEl.value}&radius_km=${radEl.value}`;
+                mapLink.href = `/map?${q}`;
+                jsonLink.href = `/api/analyze?${q}`;
+            }
+
+            [latEl, lonEl, radEl].forEach(el => el.addEventListener('input', updateLinks));
+            updateLinks();
+        </script>
+    </body>
+    </html>
+    """
+
+
 @app.get("/api/analyze")
 def api_analyze(
     lat: float = Query(50.75, ge=-85, le=85),
@@ -270,16 +339,31 @@ def get_map(
         name="🗺️ Топо-карта (Esri Topo)",
     ).add_to(m)
 
-    WmsTileLayer(
-        url="https://gibs.earthdata.nasa.gov/wms/epsg3857/best/wms.cgi",
-        layers="MODIS_Terra_NDVI_8Day",
-        name="🌱 NDVI Індекс рослинності (NASA)",
-        fmt="image/png",
-        transparent=True,
-        overlay=True,
-        opacity=0.6,
-        attr="NASA GIBS / EOSDIS",
-    ).add_to(m)
+    if COPERNICUS_INSTANCE_ID:
+        # Чіткий NDVI Sentinel-2 (10 м/піксель) через Copernicus Data Space / Sentinel Hub.
+        # Потребує заздалегідь створеного layer'а "NDVI" у вашій конфігурації на dataspace.copernicus.eu.
+        WmsTileLayer(
+            url=f"https://sh.dataspace.copernicus.eu/ogc/wms/{COPERNICUS_INSTANCE_ID}",
+            layers="NDVI",
+            name="🌱 NDVI Sentinel-2 (Copernicus, 10м)",
+            fmt="image/png",
+            transparent=True,
+            overlay=True,
+            opacity=0.75,
+            attr="Copernicus Sentinel Data / Sentinel Hub",
+        ).add_to(m)
+    else:
+        # Запасний варіант без реєстрації — грубіший (250-500 м/піксель).
+        WmsTileLayer(
+            url="https://gibs.earthdata.nasa.gov/wms/epsg3857/best/wms.cgi",
+            layers="MODIS_Terra_NDVI_8Day",
+            name="🌱 NDVI MODIS (запасний, 250-500м)",
+            fmt="image/png",
+            transparent=True,
+            overlay=True,
+            opacity=0.75,
+            attr="NASA GIBS / EOSDIS",
+        ).add_to(m)
 
     WmsTileLayer(
         url="https://gibs.earthdata.nasa.gov/wms/epsg3857/best/wms.cgi",
