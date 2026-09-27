@@ -36,7 +36,7 @@ COPERNICUS_INSTANCE_ID = os.environ.get("COPERNICUS_INSTANCE_ID", "").strip()
 # ID вашого кастомного evalscript-шару (створюється вручну в Configuration Utility —
 # див. інструкцію в чаті). За замовчуванням очікується назва MOWN_DETECT, але можна
 # перейменувати через змінну середовища, якщо назвали шар інакше.
-COPERNICUS_MOWN_LAYER = os.environ.get("COPERNICUS_MOWN_LAYER", "MOWN_DETECT").strip()
+COPERNICUS_MOWN_LAYER = os.environ.get("COPERNICUS_MOWN_LAYER", "HARVESTED-FIELDS").strip()
 
 # Скільки днів назад шукати безхмарний знімок. Sentinel-2 пролітає над однією точкою
 # приблизно раз на 5 днів — 60-денне вікно майже завжди дає хоча б один прийнятний кадр,
