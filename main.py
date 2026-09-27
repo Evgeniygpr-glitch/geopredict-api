@@ -286,6 +286,84 @@ def analyze_site_kr(grid: np.ndarray, r: int, c: int, lat_v: float, lon_v: float
         "aspect_deg": round(float(aspect_deg), 1),
         "sun_score": float(sun_score),
         "is_tip": bool(tip_score >= 0.65),
+        "culture": "kr",
+    }
+
+
+def score_height_chernyakhiv(delta_h: float) -> float:
+    """Фактор А: висота над заплавою. Ідеал 3-10 м, різкий спад за межами."""
+    if delta_h < 2.0 or delta_h > 25.0:
+        return 0.0
+    if delta_h < 3.0:
+        return delta_h / 3.0  # лінійний перехід 2.0м(=0) -> 3.0м(=1.0)
+    if delta_h <= 10.0:
+        return 1.0
+    # 10-25 м: лінійне падіння до нуля
+    return max(0.0, 1.0 - (delta_h - 10.0) / 15.0)
+
+
+def score_water_chernyakhiv(dist_water_m: float) -> float:
+    """Фактор Б: відстань до води. Ідеал <=150 м, далі спадає."""
+    if dist_water_m <= 150.0:
+        return 1.0
+    return max(0.0, 1.0 - (dist_water_m - 150.0) / 350.0)
+
+
+def score_slope_chernyakhiv(slope_deg: float) -> float:
+    """Фактор В: крутизна. Оптимум 2-6°, надто рівно чи надто круто — гірше."""
+    if 2.0 <= slope_deg <= 6.0:
+        return 1.0
+    if slope_deg < 2.0:
+        return 0.5 + 0.5 * (slope_deg / 2.0)  # 0°→0.5, 2°→1.0 (погано дренує, але не критично)
+    # 6-10°: спад до нуля (>10° відсікається раніше жорстким фільтром плато)
+    return max(0.0, 1.0 - (slope_deg - 6.0) / 4.0)
+
+
+def score_sun_chernyakhiv(aspect_deg: float) -> float:
+    """Фактор Г: експозиція. Ідеал — Південь (180°), прийнятно ПдС/ПдЗ."""
+    ideal_rad = math.radians(180.0)
+    aspect_rad = math.radians(aspect_deg)
+    return max(0.0, math.cos(aspect_rad - ideal_rad))
+
+
+def analyze_site_chernyakhiv(grid: np.ndarray, r: int, c: int, lat_v: float, lon_v: float, cell_size_m: float):
+    z_center = float(grid[r, c])
+
+    slope_deg, aspect_deg, _ = calc_geomorphology(grid, r, c, cell_size_m)
+
+    # Фільтр плато: черняхівці не будували на схилах крутіших за 10° —
+    # і, на відміну від КР, тут НЕ шукаємо мисовий перепад з 3+ сторін:
+    # тераса може плавно переходити у височину з одного боку.
+    if slope_deg > 10.0:
+        return None
+
+    search_r = max(3, min(12, int(450.0 / cell_size_m)))
+    min_z, dist_to_water_m = nearest_lower_point(grid, r, c, search_r, cell_size_m)
+    delta_h = z_center - min_z
+
+    s_height = score_height_chernyakhiv(delta_h)
+    if s_height <= 0.0:
+        return None  # затоплення (< 2м) або зависоко (> 25м) — категорично ні
+
+    s_water = score_water_chernyakhiv(dist_to_water_m)
+    s_slope = score_slope_chernyakhiv(slope_deg)
+    s_sun = score_sun_chernyakhiv(aspect_deg)
+
+    # Висота над заплавою і вода — критичні фактори (найбільша вага),
+    # схил і сонце — допоміжні.
+    final_score = (0.35 * s_height + 0.35 * s_water + 0.20 * s_slope + 0.10 * s_sun) * 100
+
+    return {
+        "lat": float(lat_v),
+        "lon": float(lon_v),
+        "score": round(float(final_score), 1),
+        "elevation_m": round(float(z_center), 1),
+        "delta_h_m": round(float(delta_h), 1),
+        "dist_water_m": int(round(float(dist_to_water_m))),
+        "slope_deg": round(float(slope_deg), 1),
+        "aspect_deg": round(float(aspect_deg), 1),
+        "sun_score": round(float(s_sun), 2),
+        "culture": "cherniakhiv",
     }
 
 
@@ -332,25 +410,34 @@ def choose_grid_steps(radius_km: float) -> int:
 
 
 @lru_cache(maxsize=64)
-def run_analysis(lat: float, lon: float, radius_km: float) -> tuple:
-    """Кешований аналіз: однакові (lat, lon, radius_km) рахуються лише один раз."""
+def run_analysis(lat: float, lon: float, radius_km: float, culture: str = "kr") -> tuple:
+    """Кешований аналіз. culture: 'kr' (Київська Русь), 'cherniakhiv' або 'both'."""
     grid_steps = choose_grid_steps(radius_km)
     grid, lats, lons, cell_size_m = build_grid(lat, lon, radius_km, grid_steps)
 
     rows, cols = grid.shape
-    raw_results = []
+    raw_kr, raw_chern = [], []
 
     for r in range(3, rows - 3):
         for c in range(3, cols - 3):
             lat_v = round(float(lats[r]), 5)
             lon_v = round(float(lons[c]), 5)
-            res = analyze_site_kr(grid, r, c, lat_v, lon_v, cell_size_m)
-            if res and res["score"] >= 42.0:
-                raw_results.append(res)
 
-    clean_results = strict_nms_clustering(raw_results, min_dist_m=130.0)
+            if culture in ("kr", "both"):
+                res = analyze_site_kr(grid, r, c, lat_v, lon_v, cell_size_m)
+                if res and res["score"] >= 42.0:
+                    raw_kr.append(res)
+
+            if culture in ("cherniakhiv", "both"):
+                res_c = analyze_site_chernyakhiv(grid, r, c, lat_v, lon_v, cell_size_m)
+                if res_c and res_c["score"] >= 42.0:
+                    raw_chern.append(res_c)
+
     limit = 35 if radius_km >= 10 else 20
-    return tuple(clean_results[:limit])
+    clean_kr = strict_nms_clustering(raw_kr, min_dist_m=130.0)[:limit]
+    clean_chern = strict_nms_clustering(raw_chern, min_dist_m=100.0)[:limit]
+
+    return tuple(clean_kr + clean_chern)
 
 
 # --------------------------------------------------------------------------
@@ -431,15 +518,17 @@ def api_analyze(
     lat: float = Query(50.75, ge=-85, le=85),
     lon: float = Query(33.47, ge=-180, le=180),
     radius_km: float = Query(10.0, ge=MIN_RADIUS_KM, le=MAX_RADIUS_KM),
+    culture: str = Query("kr", pattern="^(kr|cherniakhiv|both)$"),
 ):
     """
     Легкий JSON-ендпоінт для мобільного клієнта (Solar2D).
-    Повертає лише координати та метрики знайдених об'єктів, без HTML.
+    culture: 'kr' — Київська Русь, 'cherniakhiv' — черняхівська культура, 'both' — обидві.
     """
-    results = run_analysis(round(lat, 5), round(lon, 5), round(radius_km, 2))
+    results = run_analysis(round(lat, 5), round(lon, 5), round(radius_km, 2), culture)
     return {
         "center": {"lat": lat, "lon": lon},
         "radius_km": radius_km,
+        "culture": culture,
         "count": len(results),
         "results": list(results),
     }
@@ -450,9 +539,10 @@ def get_map(
     lat: float = Query(50.75, ge=-85, le=85),
     lon: float = Query(33.47, ge=-180, le=180),
     radius_km: float = Query(10.0, ge=MIN_RADIUS_KM, le=MAX_RADIUS_KM),
+    culture: str = Query("kr", pattern="^(kr|cherniakhiv|both)$"),
 ):
     """HTML-мапа лишається для власного дебагу в браузері — Solar2D її не використовує."""
-    results = run_analysis(round(lat, 5), round(lon, 5), round(radius_km, 2))
+    results = run_analysis(round(lat, 5), round(lon, 5), round(radius_km, 2), culture)
 
     m = folium.Map(
         location=[lat, lon],
@@ -537,17 +627,26 @@ def get_map(
     ).add_to(m)
 
     for idx, pt in enumerate(results, 1):
-        if pt["score"] >= 68:
-            color = "red"
-        elif pt["score"] >= 52:
-            color = "orange"
+        is_chernyakhiv = pt.get("culture") == "cherniakhiv"
+
+        if is_chernyakhiv:
+            # Фіолетова гама — черняхівська культура (відкриті поселення на терасах)
+            color = "purple" if pt["score"] >= 68 else "mediumpurple" if pt["score"] >= 52 else "plum"
+            type_label = "Черняхівське поселення (тераса)"
         else:
-            color = "darkblue"
+            # Червоно-синя гама — Київська Русь (оборонні миси)
+            if pt["score"] >= 68:
+                color = "red"
+            elif pt["score"] >= 52:
+                color = "orange"
+            else:
+                color = "darkblue"
+            type_label = "Оборонний мис (Городище)" if pt.get("is_tip") else "Терасове селище"
 
         popup_html = f"""
         <div style='font-family: sans-serif; width: 230px;'>
-            <h4 style='margin:0 0 5px 0; color:#d9534f;'>Ціль КР #{idx} (Бал: {pt['score']}%)</h4>
-            <b>Тип:</b> {'Оборонний мис (Городище)' if pt['is_tip'] else 'Терасове селище'}<br>
+            <h4 style='margin:0 0 5px 0; color:#d9534f;'>Ціль #{idx} (Бал: {pt['score']}%)</h4>
+            <b>Тип:</b> {type_label}<br>
             <b>Висота над низиною:</b> +{pt['delta_h_m']} м<br>
             <b>Абс. висота:</b> {pt['elevation_m']} м<br>
             <b>До річки/заплави:</b> ~{pt['dist_water_m']} м<br>
