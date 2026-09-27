@@ -11,7 +11,7 @@ import srtm
 import folium
 from folium.raster_layers import WmsTileLayer, ImageOverlay
 from fastapi import FastAPI, Query
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 
 # --------------------------------------------------------------------------
@@ -409,11 +409,117 @@ def choose_grid_steps(radius_km: float) -> int:
     return max(MIN_GRID_STEPS, min(MAX_GRID_STEPS, steps))
 
 
+@lru_cache(maxsize=32)
+def get_grid_bundle(lat: float, lon: float, radius_km: float):
+    """
+    Спільна кешована сітка висот — і пошук городищ/терас, і аналіз ярів
+    використовують ОДНУ й ту саму сітку замість повторних SRTM-запитів.
+    """
+    grid_steps = choose_grid_steps(radius_km)
+    return build_grid(lat, lon, radius_km, grid_steps)
+
+
+# --------------------------------------------------------------------------
+# Аналіз ярів/струмків (D8 flow accumulation)
+# --------------------------------------------------------------------------
+# Стандартний гідрологічний метод: для кожної клітинки визначаємо, куди
+# фізично стікала б вода (до найкрутішого нижчого сусіда — 8 напрямків),
+# а тоді накопичуємо площу водозбору вниз за течією. Клітинки з великою
+# накопиченою площею — це тальвеги яруг/струмків, навіть якщо зараз там
+# сухо. "Голова" такого тальвега (де накопичена площа щойно перевищила
+# поріг) — ймовірне місце виходу джерела, саме туди, за спостереженням,
+# і селились черняхівці.
+
+RAVINE_AREA_THRESHOLD_M2 = 20000.0  # ~2 га водозбору — поріг зарахування до "яру/струмка"
+RAVINE_DIRS = [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)]
+
+
+def compute_flow_accumulation(grid: np.ndarray, cell_size_m: float):
+    rows, cols = grid.shape
+    flow_to = np.full((rows, cols, 2), -1, dtype=np.int32)
+
+    for r in range(rows):
+        for c in range(cols):
+            z = grid[r, c]
+            best_slope = 0.0
+            best_rc = (-1, -1)
+            for dr, dc in RAVINE_DIRS:
+                nr, nc = r + dr, c + dc
+                if 0 <= nr < rows and 0 <= nc < cols:
+                    dist = cell_size_m * (1.41421356 if dr != 0 and dc != 0 else 1.0)
+                    slope = (z - grid[nr, nc]) / dist
+                    if slope > best_slope:
+                        best_slope = slope
+                        best_rc = (nr, nc)
+            flow_to[r, c] = best_rc
+
+    # Топологічна обробка від найвищих клітинок до найнижчих — накопичуємо площу вниз за течією.
+    acc = np.ones((rows, cols), dtype=np.float64)
+    order = np.argsort(-grid, axis=None)
+    for idx in order:
+        r, c = divmod(int(idx), cols)
+        tr, tc = flow_to[r, c]
+        if tr >= 0:
+            acc[tr, tc] += acc[r, c]
+
+    return acc, flow_to
+
+
+def detect_channel_heads(grid: np.ndarray, acc: np.ndarray, flow_to: np.ndarray, cell_size_m: float):
+    rows, cols = grid.shape
+    cell_area_m2 = cell_size_m ** 2
+    channel_mask = (acc * cell_area_m2) >= RAVINE_AREA_THRESHOLD_M2
+
+    has_channel_contributor = np.zeros((rows, cols), dtype=bool)
+    for r in range(rows):
+        for c in range(cols):
+            if not channel_mask[r, c]:
+                continue
+            for dr, dc in RAVINE_DIRS:
+                nr, nc = r + dr, c + dc
+                if 0 <= nr < rows and 0 <= nc < cols:
+                    tr, tc = flow_to[nr, nc]
+                    if tr == r and tc == c and channel_mask[nr, nc]:
+                        has_channel_contributor[r, c] = True
+                        break
+
+    heads_mask = channel_mask & (~has_channel_contributor)
+    return channel_mask, heads_mask
+
+
+@lru_cache(maxsize=32)
+def analyze_ravines(lat: float, lon: float, radius_km: float):
+    """Повертає (heads, segments): точки-початки яруг/джерел і лінії тальвегів для карти."""
+    grid, lats, lons, cell_size_m = get_grid_bundle(lat, lon, radius_km)
+    acc, flow_to = compute_flow_accumulation(grid, cell_size_m)
+    channel_mask, heads_mask = detect_channel_heads(grid, acc, flow_to, cell_size_m)
+
+    rows, cols = grid.shape
+    heads = []
+    segments = []
+    for r in range(rows):
+        for c in range(cols):
+            if heads_mask[r, c]:
+                heads.append({
+                    "lat": round(float(lats[r]), 5),
+                    "lon": round(float(lons[c]), 5),
+                    "elevation_m": round(float(grid[r, c]), 1),
+                })
+            if channel_mask[r, c]:
+                tr, tc = flow_to[r, c]
+                if tr >= 0 and channel_mask[tr, tc]:
+                    segments.append((
+                        (round(float(lats[r]), 5), round(float(lons[c]), 5)),
+                        (round(float(lats[tr]), 5), round(float(lons[tc]), 5)),
+                    ))
+
+    return tuple(heads), tuple(segments)
+
+
 @lru_cache(maxsize=64)
 def run_analysis(lat: float, lon: float, radius_km: float, culture: str = "kr") -> tuple:
     """Кешований аналіз. culture: 'kr' (Київська Русь), 'cherniakhiv' або 'both'."""
-    grid_steps = choose_grid_steps(radius_km)
-    grid, lats, lons, cell_size_m = build_grid(lat, lon, radius_km, grid_steps)
+    grid, lats, lons, cell_size_m = get_grid_bundle(lat, lon, radius_km)
 
     rows, cols = grid.shape
     raw_kr, raw_chern = [], []
@@ -511,6 +617,108 @@ def test_form():
     </body>
     </html>
     """
+
+
+@app.get("/api/inspect")
+def api_inspect(
+    points: str = Query(
+        ...,
+        description="Список точок через ';': lat1,lon1,мітка1;lat2,lon2,мітка2;...",
+    ),
+    format: str = Query("json", pattern="^(json|csv)$"),
+):
+    """
+    Службовий ендпоінт для калібрування порогів: показує СИРІ розраховані
+    значення (висота, перепад, відстань до води, схил, азимут) для будь-якої
+    точки — навіть якщо вона НЕ проходить поточні пороги в analyze_site_*.
+    Третій (опційний) елемент кожної точки — довільна мітка (наприклад, назва
+    з відомого каталогу пам'яток), просто повертається назад для звірки.
+    format=csv — завантажує результат як CSV-файл (зручно на мобільному).
+    """
+    inspect_radius_km = 1.0
+    grid_steps = choose_grid_steps(inspect_radius_km)
+
+    out = []
+    for raw_pt in points.split(";"):
+        raw_pt = raw_pt.strip()
+        if not raw_pt:
+            continue
+        parts = raw_pt.split(",")
+        label = parts[2] if len(parts) >= 3 else ""
+        try:
+            lat, lon = float(parts[0]), float(parts[1])
+        except (ValueError, IndexError):
+            out.append({"input": raw_pt, "label": label, "error": "Очікується формат lat,lon[,мітка]"})
+            continue
+
+        try:
+            grid, lats, lons, cell_size_m = get_grid_bundle(lat, lon, inspect_radius_km)
+            r = int(np.argmin(np.abs(lats - lat)))
+            c = int(np.argmin(np.abs(lons - lon)))
+
+            z_center = float(grid[r, c])
+            slope_deg, aspect_deg, _ = calc_geomorphology(grid, r, c, cell_size_m)
+
+            search_r = max(3, min(12, int(450.0 / cell_size_m)))
+            min_z, dist_water_m = nearest_lower_point(grid, r, c, search_r, cell_size_m)
+            delta_h = z_center - min_z
+
+            tip_score = detect_promontory_kr(grid, r, c)
+
+            out.append({
+                "label": label,
+                "lat": lat,
+                "lon": lon,
+                "elevation_m": round(z_center, 1),
+                "delta_h_m": round(delta_h, 1),
+                "dist_water_m": round(dist_water_m),
+                "slope_deg": round(slope_deg, 1),
+                "aspect_deg": round(aspect_deg, 1),
+                "kr_tip_score": round(float(tip_score), 2),
+                "chern_s_height": round(score_height_chernyakhiv(delta_h), 2),
+                "chern_s_water": round(score_water_chernyakhiv(dist_water_m), 2),
+                "chern_s_slope": round(score_slope_chernyakhiv(slope_deg), 2),
+                "chern_s_sun": round(score_sun_chernyakhiv(aspect_deg), 2),
+            })
+        except Exception as exc:
+            out.append({"label": label, "lat": lat, "lon": lon, "error": str(exc)})
+
+    if format == "csv":
+        cols = ["label", "lat", "lon", "elevation_m", "delta_h_m", "dist_water_m",
+                "slope_deg", "aspect_deg", "kr_tip_score", "chern_s_height",
+                "chern_s_water", "chern_s_slope", "chern_s_sun", "error"]
+        lines = [",".join(cols)]
+        for row in out:
+            lines.append(",".join(str(row.get(k, "")) for k in cols))
+        csv_text = "\n".join(lines)
+        return Response(
+            content=csv_text,
+            media_type="text/csv",
+            headers={"Content-Disposition": "attachment; filename=inspect_results.csv"},
+        )
+
+    return {"points": out}
+
+
+@app.get("/api/ravines")
+def api_ravines(
+    lat: float = Query(50.75, ge=-85, le=85),
+    lon: float = Query(33.47, ge=-180, le=180),
+    radius_km: float = Query(5.0, ge=MIN_RADIUS_KM, le=MAX_RADIUS_KM),
+):
+    """
+    Реконструкція яруг/струмків методом D8 flow accumulation.
+    'heads' — ймовірні початки яруг/джерела (де могли селитись черняхівці).
+    'segments' — лінії тальвегів для візуалізації мережі стоку.
+    """
+    heads, segments = analyze_ravines(round(lat, 5), round(lon, 5), round(radius_km, 2))
+    return {
+        "center": {"lat": lat, "lon": lon},
+        "radius_km": radius_km,
+        "heads_count": len(heads),
+        "heads": list(heads),
+        "segments": [list(s) for s in segments],
+    }
 
 
 @app.get("/api/analyze")
@@ -674,6 +882,23 @@ def get_map(
             opacity=1.0,
             name="🌾 Скошені/зібрані ділянки (падіння NDVI від піку)",
         ).add_to(m)
+
+    ravine_heads, ravine_segments = analyze_ravines(round(lat, 5), round(lon, 5), round(radius_km, 2))
+    ravine_fg = folium.FeatureGroup(name="🏞️ Яри/струмки (реконструкція стоку)")
+    for p1, p2 in ravine_segments:
+        folium.PolyLine([p1, p2], color="#1f78ff", weight=2, opacity=0.55).add_to(ravine_fg)
+    for h in ravine_heads:
+        folium.CircleMarker(
+            location=[h["lat"], h["lon"]],
+            radius=5,
+            color="#00bcd4",
+            fill=True,
+            fill_color="#00bcd4",
+            fill_opacity=0.95,
+            popup=f"Ймовірний початок яру / джерело<br>Висота: {h['elevation_m']} м",
+            tooltip="Джерело / початок яру",
+        ).add_to(ravine_fg)
+    ravine_fg.add_to(m)
 
     folium.LayerControl(collapsed=False).add_to(m)
     return m._repr_html_()
