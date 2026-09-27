@@ -1,6 +1,7 @@
 import os
 import math
 import io
+import json
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 
@@ -30,6 +31,48 @@ MIN_RADIUS_KM = 0.5
 TARGET_CELL_M = 35.0   # цільовий розмір клітинки сітки (SRTM ~30м/піксель)
 MIN_GRID_STEPS = 40
 MAX_GRID_STEPS = 160    # жорсткий стеля, щоб запит завжди встигав у таймаут Render
+
+# --------------------------------------------------------------------------
+# Прекомп'ютовані яри/джерела (щоб не рахувати наживо щоразу)
+# --------------------------------------------------------------------------
+# Одноразово прораховуєте великий регіон через /api/ravines?...&download=true,
+# зберігаєте отриманий JSON у репозиторій як data/precomputed_ravines.json,
+# і при наступних запитах для тієї ж зони дані читаються миттєво з файлу
+# замість повторного SRTM-аналізу.
+PRECOMPUTED_RAVINES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "precomputed_ravines.json")
+PRECOMPUTED_TILES = []
+
+try:
+    with open(PRECOMPUTED_RAVINES_PATH, "r", encoding="utf-8") as f:
+        PRECOMPUTED_TILES = json.load(f).get("tiles", [])
+    print(f"[precompute] Завантажено {len(PRECOMPUTED_TILES)} прекомп'ютованих плиток ярів.")
+except FileNotFoundError:
+    print(f"[precompute] Файл {PRECOMPUTED_RAVINES_PATH} не знайдено — працюємо в режимі живого обчислення.")
+except Exception as exc:
+    print(f"[precompute] Помилка читання {PRECOMPUTED_RAVINES_PATH}: {exc}")
+
+
+def _dist_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    d_lat = (lat1 - lat2) * 111000.0
+    d_lon = (lon1 - lon2) * 111000.0 * math.cos(math.radians(lat1))
+    return math.sqrt(d_lat ** 2 + d_lon ** 2)
+
+
+def _bbox(lat: float, lon: float, radius_km: float):
+    lat_delta = radius_km / 111.0
+    lon_delta = radius_km / (111.0 * math.cos(math.radians(lat)))
+    return lat - lat_delta, lat + lat_delta, lon - lon_delta, lon + lon_delta
+
+
+def find_covering_tile(lat: float, lon: float, radius_km: float):
+    """Чи є прекомп'ютована плитка, яка ПОВНІСТЮ покриває запитувану область?"""
+    q_min_lat, q_max_lat, q_min_lon, q_max_lon = _bbox(lat, lon, radius_km)
+    for tile in PRECOMPUTED_TILES:
+        b = tile["bounds"]
+        if (b["min_lat"] <= q_min_lat and b["max_lat"] >= q_max_lat and
+                b["min_lon"] <= q_min_lon and b["max_lon"] >= q_max_lon):
+            return tile
+    return None
 
 # Опційна інтеграція Copernicus Data Space (Sentinel Hub) для чіткого NDVI (10 м/піксель).
 # Якщо змінна не задана — використовується запасний шар NASA GIBS MODIS NDVI (250-500 м/піксель,
@@ -511,9 +554,9 @@ def detect_channel_heads(grid: np.ndarray, acc: np.ndarray, flow_to: np.ndarray,
 @lru_cache(maxsize=32)
 def get_channel_heads_and_masks(lat: float, lon: float, radius_km: float):
     """
-    Обчислює яри/джерела ОДИН РАЗ (кешовано) для заданого центру й радіуса.
-    Повертає індекси голів яруг (r,c) у координатах сітки + маски для
-    подальшого використання і у видимому шарі, і у скорингу.
+    ЖИВЕ обчислення (без прекомп'ютованого кешу) яруг/джерел для заданого
+    центру й радіуса. Повертає індекси голів яруг (r,c) у координатах сітки
+    + маски. Викликається лише коли область НЕ покрита прекомп'ютованою плиткою.
     """
     grid, lats, lons, cell_size_m = get_grid_bundle(lat, lon, radius_km)
     acc, flow_to = compute_flow_accumulation(grid, cell_size_m)
@@ -536,9 +579,30 @@ def build_spring_distance_grid(grid: np.ndarray, head_indices: tuple, cell_size_
     return dist_grid
 
 
+def get_channel_head_indices_for_scoring(lat: float, lon: float, radius_km: float,
+                                          grid: np.ndarray, lats: np.ndarray, lons: np.ndarray):
+    """
+    Індекси голів яруг у координатах ПОТОЧНОЇ сітки — для побудови карти
+    відстаней у run_analysis. Спершу перевіряє прекомп'ютований кеш
+    (миттєво), і лише якщо область не покрита — рахує наживо (SRTM+D8).
+    """
+    tile = find_covering_tile(lat, lon, radius_km)
+    if tile is not None:
+        indices = []
+        for h in tile["heads"]:
+            if _dist_m(lat, lon, h["lat"], h["lon"]) <= radius_km * 1000.0:
+                r = int(np.argmin(np.abs(lats - h["lat"])))
+                c = int(np.argmin(np.abs(lons - h["lon"])))
+                indices.append((r, c))
+        return tuple(indices)
+
+    head_indices, _, _ = get_channel_heads_and_masks(lat, lon, radius_km)
+    return head_indices
+
+
 @lru_cache(maxsize=32)
-def analyze_ravines(lat: float, lon: float, radius_km: float):
-    """Повертає (heads, segments): точки-початки яруг/джерел і лінії тальвегів для карти."""
+def _live_analyze_ravines(lat: float, lon: float, radius_km: float):
+    """Повертає (heads, segments) ЖИВИМ обчисленням — використовується лише як fallback."""
     grid, lats, lons, cell_size_m = get_grid_bundle(lat, lon, radius_km)
     head_indices, channel_mask, flow_to = get_channel_heads_and_masks(lat, lon, radius_km)
 
@@ -566,6 +630,25 @@ def analyze_ravines(lat: float, lon: float, radius_km: float):
     return tuple(heads), tuple(segments)
 
 
+def get_ravines_for_area(lat: float, lon: float, radius_km: float):
+    """
+    Публічна точка входу для отримання ярів/джерел: спершу перевіряє
+    прекомп'ютований кеш (миттєво, без SRTM-запитів), і лише якщо область
+    НЕ покрита жодною збереженою плиткою — рахує наживо.
+    """
+    tile = find_covering_tile(lat, lon, radius_km)
+    if tile is not None:
+        radius_m = radius_km * 1000.0
+        heads = tuple(h for h in tile["heads"] if _dist_m(lat, lon, h["lat"], h["lon"]) <= radius_m)
+        segments = tuple(
+            tuple(map(tuple, s)) for s in tile["segments"]
+            if _dist_m(lat, lon, s[0][0], s[0][1]) <= radius_m or _dist_m(lat, lon, s[1][0], s[1][1]) <= radius_m
+        )
+        return heads, segments
+
+    return _live_analyze_ravines(lat, lon, radius_km)
+
+
 @lru_cache(maxsize=64)
 def run_analysis(lat: float, lon: float, radius_km: float, culture: str = "kr") -> tuple:
     """Кешований аналіз. culture: 'kr' (Київська Русь), 'cherniakhiv' або 'both'."""
@@ -575,7 +658,7 @@ def run_analysis(lat: float, lon: float, radius_km: float, culture: str = "kr") 
     # використовуємо відстань до найближчого як фактор скорингу нижче.
     spring_dist_grid = None
     if culture in ("cherniakhiv", "both"):
-        head_indices, _, _ = get_channel_heads_and_masks(lat, lon, radius_km)
+        head_indices = get_channel_head_indices_for_scoring(lat, lon, radius_km, grid, lats, lons)
         spring_dist_grid = build_spring_distance_grid(grid, head_indices, cell_size_m)
 
     rows, cols = grid.shape
@@ -763,20 +846,47 @@ def api_ravines(
     lat: float = Query(50.75, ge=-85, le=85),
     lon: float = Query(33.47, ge=-180, le=180),
     radius_km: float = Query(5.0, ge=MIN_RADIUS_KM, le=MAX_RADIUS_KM),
+    download: bool = Query(
+        False,
+        description="Завантажити як JSON-файл — для одноразового прекомп'ютування "
+                    "великого регіону й додавання в data/precomputed_ravines.json",
+    ),
 ):
     """
     Реконструкція яруг/струмків методом D8 flow accumulation.
     'heads' — ймовірні початки яруг/джерела (де могли селитись черняхівці).
     'segments' — лінії тальвегів для візуалізації мережі стоку.
+    Якщо область покрита прекомп'ютованою плиткою (data/precomputed_ravines.json) —
+    відповідь миттєва, без живого SRTM/D8 обчислення.
     """
-    heads, segments = analyze_ravines(round(lat, 5), round(lon, 5), round(radius_km, 2))
-    return {
+    heads, segments = get_ravines_for_area(round(lat, 5), round(lon, 5), round(radius_km, 2))
+    min_lat, max_lat, min_lon, max_lon = _bbox(lat, lon, radius_km)
+
+    payload = {
         "center": {"lat": lat, "lon": lon},
         "radius_km": radius_km,
+        "bounds": {"min_lat": min_lat, "max_lat": max_lat, "min_lon": min_lon, "max_lon": max_lon},
         "heads_count": len(heads),
         "heads": list(heads),
         "segments": [list(s) for s in segments],
     }
+
+    if download:
+        # Формат "tiles": [...] — саме такий, який очікує data/precomputed_ravines.json.
+        tile_payload = {"tiles": [{
+            "center": payload["center"],
+            "radius_km": payload["radius_km"],
+            "bounds": payload["bounds"],
+            "heads": payload["heads"],
+            "segments": payload["segments"],
+        }]}
+        return Response(
+            content=json.dumps(tile_payload, ensure_ascii=False, indent=2),
+            media_type="application/json",
+            headers={"Content-Disposition": "attachment; filename=precomputed_ravines_tile.json"},
+        )
+
+    return payload
 
 
 @app.get("/api/analyze")
@@ -950,7 +1060,7 @@ def get_map(
             ).add_to(m)
 
     if show_ravines:
-        ravine_heads, ravine_segments = analyze_ravines(round(lat, 5), round(lon, 5), round(radius_km, 2))
+        ravine_heads, ravine_segments = get_ravines_for_area(round(lat, 5), round(lon, 5), round(radius_km, 2))
         ravine_fg = folium.FeatureGroup(name="🏞️ Яри/струмки (реконструкція стоку)")
         for p1, p2 in ravine_segments:
             folium.PolyLine([p1, p2], color="#1f78ff", weight=2, opacity=0.55).add_to(ravine_fg)
