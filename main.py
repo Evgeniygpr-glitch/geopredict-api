@@ -381,8 +381,23 @@ def score_spring_chernyakhiv(dist_spring_m: float) -> float:
     return max(0.0, 1.0 - (dist_spring_m - 100.0) / 300.0)  # спадає до 0 приблизно на 400м
 
 
+def score_hollow_chernyakhiv(dist_hollow_m: float) -> float:
+    """
+    Фактор Е: відстань до найближчої придатної ложбини під напівземлянку
+    (знайденої окремим прицільним пошуком біля витоків яруг — див.
+    find_ravine_head_hollows). Чим ближче до такої ложбини — тим ймовірніше
+    саме тут копали напівземлянку.
+    """
+    if dist_hollow_m is None or not math.isfinite(dist_hollow_m):
+        return 0.0
+    if dist_hollow_m <= 60.0:
+        return 1.0
+    return max(0.0, 1.0 - (dist_hollow_m - 60.0) / 200.0)  # спадає до 0 приблизно на 260м
+
+
 def analyze_site_chernyakhiv(grid: np.ndarray, r: int, c: int, lat_v: float, lon_v: float,
-                              cell_size_m: float, dist_to_spring_m: float = None):
+                              cell_size_m: float, dist_to_spring_m: float = None,
+                              dist_to_hollow_m: float = None):
     z_center = float(grid[r, c])
 
     slope_deg, aspect_deg, _ = calc_geomorphology(grid, r, c, cell_size_m)
@@ -405,15 +420,18 @@ def analyze_site_chernyakhiv(grid: np.ndarray, r: int, c: int, lat_v: float, lon
     s_slope = score_slope_chernyakhiv(slope_deg)
     s_sun = score_sun_chernyakhiv(aspect_deg)
     s_spring = score_spring_chernyakhiv(dist_to_spring_m)
+    s_hollow = score_hollow_chernyakhiv(dist_to_hollow_m)
 
-    # Висота над заплавою і вода — найкритичніші, близькість до витоку струмка
-    # (джерела) — суттєвий бонус, схил і сонце — допоміжні фактори.
+    # Висота над заплавою і вода — найкритичніші; близькість до витоку струмка
+    # (джерела) і до придатної ложбини під напівземлянку — суттєві бонуси;
+    # схил і сонце — допоміжні фактори.
     final_score = (
-        0.30 * s_height +
-        0.25 * s_water +
-        0.20 * s_spring +
-        0.15 * s_slope +
-        0.10 * s_sun
+        0.25 * s_height +
+        0.20 * s_water +
+        0.15 * s_spring +
+        0.20 * s_hollow +
+        0.12 * s_slope +
+        0.08 * s_sun
     ) * 100
 
     return {
@@ -424,6 +442,7 @@ def analyze_site_chernyakhiv(grid: np.ndarray, r: int, c: int, lat_v: float, lon
         "delta_h_m": round(float(delta_h), 1),
         "dist_water_m": int(round(float(dist_to_water_m))),
         "dist_spring_m": int(round(float(dist_to_spring_m))) if dist_to_spring_m is not None and math.isfinite(dist_to_spring_m) else None,
+        "dist_hollow_m": int(round(float(dist_to_hollow_m))) if dist_to_hollow_m is not None and math.isfinite(dist_to_hollow_m) else None,
         "slope_deg": round(float(slope_deg), 1),
         "aspect_deg": round(float(aspect_deg), 1),
         "sun_score": round(float(s_sun), 2),
@@ -565,16 +584,16 @@ def get_channel_heads_and_masks(lat: float, lon: float, radius_km: float):
     return head_indices, channel_mask, flow_to
 
 
-def build_spring_distance_grid(grid: np.ndarray, head_indices: tuple, cell_size_m: float) -> np.ndarray:
-    """Для кожної клітинки сітки — відстань (м) до найближчої голови яру/джерела."""
+def build_distance_grid(grid: np.ndarray, target_indices: tuple, cell_size_m: float) -> np.ndarray:
+    """Для кожної клітинки сітки — відстань (м) до найближчої цільової точки (індекси r,c)."""
     rows, cols = grid.shape
     dist_grid = np.full((rows, cols), np.inf, dtype=np.float64)
-    if not head_indices:
+    if not target_indices:
         return dist_grid
 
     rr, cc = np.indices((rows, cols))
-    for hr, hc in head_indices:
-        d = np.sqrt((rr - hr) ** 2 + (cc - hc) ** 2) * cell_size_m
+    for tr, tc in target_indices:
+        d = np.sqrt((rr - tr) ** 2 + (cc - tc) ** 2) * cell_size_m
         dist_grid = np.minimum(dist_grid, d)
     return dist_grid
 
@@ -764,11 +783,20 @@ def run_analysis(lat: float, lon: float, radius_km: float, culture: str = "kr") 
     grid, lats, lons, cell_size_m = get_grid_bundle(lat, lon, radius_km)
 
     # Для черняхівської культури спершу рахуємо яри/джерела (D8), а тоді
-    # використовуємо відстань до найближчого як фактор скорингу нижче.
+    # ще й придатні ложбини під напівземлянки біля цих джерел — і те, і те
+    # використовується як фактор скорингу нижче.
     spring_dist_grid = None
+    hollow_dist_grid = None
     if culture in ("cherniakhiv", "both"):
         head_indices = get_channel_head_indices_for_scoring(lat, lon, radius_km, grid, lats, lons)
-        spring_dist_grid = build_spring_distance_grid(grid, head_indices, cell_size_m)
+        spring_dist_grid = build_distance_grid(grid, head_indices, cell_size_m)
+
+        hollows = get_hollows_for_area(lat, lon, radius_km)
+        hollow_indices = tuple(
+            (int(np.argmin(np.abs(lats - h["lat"]))), int(np.argmin(np.abs(lons - h["lon"]))))
+            for h in hollows
+        )
+        hollow_dist_grid = build_distance_grid(grid, hollow_indices, cell_size_m)
 
     rows, cols = grid.shape
     raw_kr, raw_chern = [], []
@@ -785,7 +813,8 @@ def run_analysis(lat: float, lon: float, radius_km: float, culture: str = "kr") 
 
             if culture in ("cherniakhiv", "both"):
                 dist_spring = float(spring_dist_grid[r, c]) if spring_dist_grid is not None else None
-                res_c = analyze_site_chernyakhiv(grid, r, c, lat_v, lon_v, cell_size_m, dist_spring)
+                dist_hollow = float(hollow_dist_grid[r, c]) if hollow_dist_grid is not None else None
+                res_c = analyze_site_chernyakhiv(grid, r, c, lat_v, lon_v, cell_size_m, dist_spring, dist_hollow)
                 if res_c and res_c["score"] >= 42.0:
                     raw_chern.append(res_c)
 
@@ -1154,6 +1183,10 @@ def get_map(
         if pt.get("dist_spring_m") is not None:
             spring_line = f"<b>До витоку яру/джерела:</b> ~{pt['dist_spring_m']} м<br>"
 
+        hollow_line = ""
+        if pt.get("dist_hollow_m") is not None:
+            hollow_line = f"<b>До ложбини під напівземлянку:</b> ~{pt['dist_hollow_m']} м<br>"
+
         popup_html = f"""
         <div style='font-family: sans-serif; width: 230px;'>
             <h4 style='margin:0 0 5px 0; color:#d9534f;'>Ціль #{idx} (Бал: {pt['score']}%)</h4>
@@ -1162,6 +1195,7 @@ def get_map(
             <b>Абс. висота:</b> {pt['elevation_m']} м<br>
             <b>До річки/заплави:</b> ~{pt['dist_water_m']} м<br>
             {spring_line}
+            {hollow_line}
             <b>Схил / Сонце:</b> {pt['aspect_deg']}° ({int(pt['sun_score'] * 100)}%)
         </div>
         """
