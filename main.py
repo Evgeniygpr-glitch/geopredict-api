@@ -326,7 +326,20 @@ def score_sun_chernyakhiv(aspect_deg: float) -> float:
     return max(0.0, math.cos(aspect_rad - ideal_rad))
 
 
-def analyze_site_chernyakhiv(grid: np.ndarray, r: int, c: int, lat_v: float, lon_v: float, cell_size_m: float):
+def score_spring_chernyakhiv(dist_spring_m: float) -> float:
+    """
+    Фактор Д: відстань до найближчого ЯВНОГО початку яру/джерела (з D8-аналізу стоку).
+    Черняхівці охоче селились саме біля витоку струмка — там чиста джерельна вода.
+    """
+    if dist_spring_m is None or not math.isfinite(dist_spring_m):
+        return 0.0
+    if dist_spring_m <= 100.0:
+        return 1.0
+    return max(0.0, 1.0 - (dist_spring_m - 100.0) / 300.0)  # спадає до 0 приблизно на 400м
+
+
+def analyze_site_chernyakhiv(grid: np.ndarray, r: int, c: int, lat_v: float, lon_v: float,
+                              cell_size_m: float, dist_to_spring_m: float = None):
     z_center = float(grid[r, c])
 
     slope_deg, aspect_deg, _ = calc_geomorphology(grid, r, c, cell_size_m)
@@ -348,10 +361,17 @@ def analyze_site_chernyakhiv(grid: np.ndarray, r: int, c: int, lat_v: float, lon
     s_water = score_water_chernyakhiv(dist_to_water_m)
     s_slope = score_slope_chernyakhiv(slope_deg)
     s_sun = score_sun_chernyakhiv(aspect_deg)
+    s_spring = score_spring_chernyakhiv(dist_to_spring_m)
 
-    # Висота над заплавою і вода — критичні фактори (найбільша вага),
-    # схил і сонце — допоміжні.
-    final_score = (0.35 * s_height + 0.35 * s_water + 0.20 * s_slope + 0.10 * s_sun) * 100
+    # Висота над заплавою і вода — найкритичніші, близькість до витоку струмка
+    # (джерела) — суттєвий бонус, схил і сонце — допоміжні фактори.
+    final_score = (
+        0.30 * s_height +
+        0.25 * s_water +
+        0.20 * s_spring +
+        0.15 * s_slope +
+        0.10 * s_sun
+    ) * 100
 
     return {
         "lat": float(lat_v),
@@ -360,6 +380,7 @@ def analyze_site_chernyakhiv(grid: np.ndarray, r: int, c: int, lat_v: float, lon
         "elevation_m": round(float(z_center), 1),
         "delta_h_m": round(float(delta_h), 1),
         "dist_water_m": int(round(float(dist_to_water_m))),
+        "dist_spring_m": int(round(float(dist_to_spring_m))) if dist_to_spring_m is not None and math.isfinite(dist_to_spring_m) else None,
         "slope_deg": round(float(slope_deg), 1),
         "aspect_deg": round(float(aspect_deg), 1),
         "sun_score": round(float(s_sun), 2),
@@ -488,23 +509,52 @@ def detect_channel_heads(grid: np.ndarray, acc: np.ndarray, flow_to: np.ndarray,
 
 
 @lru_cache(maxsize=32)
-def analyze_ravines(lat: float, lon: float, radius_km: float):
-    """Повертає (heads, segments): точки-початки яруг/джерел і лінії тальвегів для карти."""
+def get_channel_heads_and_masks(lat: float, lon: float, radius_km: float):
+    """
+    Обчислює яри/джерела ОДИН РАЗ (кешовано) для заданого центру й радіуса.
+    Повертає індекси голів яруг (r,c) у координатах сітки + маски для
+    подальшого використання і у видимому шарі, і у скорингу.
+    """
     grid, lats, lons, cell_size_m = get_grid_bundle(lat, lon, radius_km)
     acc, flow_to = compute_flow_accumulation(grid, cell_size_m)
     channel_mask, heads_mask = detect_channel_heads(grid, acc, flow_to, cell_size_m)
+    head_indices = tuple(map(tuple, np.argwhere(heads_mask)))
+    return head_indices, channel_mask, flow_to
+
+
+def build_spring_distance_grid(grid: np.ndarray, head_indices: tuple, cell_size_m: float) -> np.ndarray:
+    """Для кожної клітинки сітки — відстань (м) до найближчої голови яру/джерела."""
+    rows, cols = grid.shape
+    dist_grid = np.full((rows, cols), np.inf, dtype=np.float64)
+    if not head_indices:
+        return dist_grid
+
+    rr, cc = np.indices((rows, cols))
+    for hr, hc in head_indices:
+        d = np.sqrt((rr - hr) ** 2 + (cc - hc) ** 2) * cell_size_m
+        dist_grid = np.minimum(dist_grid, d)
+    return dist_grid
+
+
+@lru_cache(maxsize=32)
+def analyze_ravines(lat: float, lon: float, radius_km: float):
+    """Повертає (heads, segments): точки-початки яруг/джерел і лінії тальвегів для карти."""
+    grid, lats, lons, cell_size_m = get_grid_bundle(lat, lon, radius_km)
+    head_indices, channel_mask, flow_to = get_channel_heads_and_masks(lat, lon, radius_km)
 
     rows, cols = grid.shape
-    heads = []
+    heads = [
+        {
+            "lat": round(float(lats[r]), 5),
+            "lon": round(float(lons[c]), 5),
+            "elevation_m": round(float(grid[r, c]), 1),
+        }
+        for r, c in head_indices
+    ]
+
     segments = []
     for r in range(rows):
         for c in range(cols):
-            if heads_mask[r, c]:
-                heads.append({
-                    "lat": round(float(lats[r]), 5),
-                    "lon": round(float(lons[c]), 5),
-                    "elevation_m": round(float(grid[r, c]), 1),
-                })
             if channel_mask[r, c]:
                 tr, tc = flow_to[r, c]
                 if tr >= 0 and channel_mask[tr, tc]:
@@ -521,6 +571,13 @@ def run_analysis(lat: float, lon: float, radius_km: float, culture: str = "kr") 
     """Кешований аналіз. culture: 'kr' (Київська Русь), 'cherniakhiv' або 'both'."""
     grid, lats, lons, cell_size_m = get_grid_bundle(lat, lon, radius_km)
 
+    # Для черняхівської культури спершу рахуємо яри/джерела (D8), а тоді
+    # використовуємо відстань до найближчого як фактор скорингу нижче.
+    spring_dist_grid = None
+    if culture in ("cherniakhiv", "both"):
+        head_indices, _, _ = get_channel_heads_and_masks(lat, lon, radius_km)
+        spring_dist_grid = build_spring_distance_grid(grid, head_indices, cell_size_m)
+
     rows, cols = grid.shape
     raw_kr, raw_chern = [], []
 
@@ -535,7 +592,8 @@ def run_analysis(lat: float, lon: float, radius_km: float, culture: str = "kr") 
                     raw_kr.append(res)
 
             if culture in ("cherniakhiv", "both"):
-                res_c = analyze_site_chernyakhiv(grid, r, c, lat_v, lon_v, cell_size_m)
+                dist_spring = float(spring_dist_grid[r, c]) if spring_dist_grid is not None else None
+                res_c = analyze_site_chernyakhiv(grid, r, c, lat_v, lon_v, cell_size_m, dist_spring)
                 if res_c and res_c["score"] >= 42.0:
                     raw_chern.append(res_c)
 
@@ -748,6 +806,8 @@ def get_map(
     lon: float = Query(33.47, ge=-180, le=180),
     radius_km: float = Query(10.0, ge=MIN_RADIUS_KM, le=MAX_RADIUS_KM),
     culture: str = Query("kr", pattern="^(kr|cherniakhiv|both)$"),
+    show_ravines: bool = Query(False, description="Аналіз ярів/струмків (D8) — повільно, вимкнено за замовчуванням"),
+    show_harvest: bool = Query(False, description="Шар 'скошені поля' (4 запити до Copernicus) — повільно"),
 ):
     """HTML-мапа лишається для власного дебагу в браузері — Solar2D її не використовує."""
     results = run_analysis(round(lat, 5), round(lon, 5), round(radius_km, 2), culture)
@@ -851,6 +911,10 @@ def get_map(
                 color = "darkblue"
             type_label = "Оборонний мис (Городище)" if pt.get("is_tip") else "Терасове селище"
 
+        spring_line = ""
+        if pt.get("dist_spring_m") is not None:
+            spring_line = f"<b>До витоку яру/джерела:</b> ~{pt['dist_spring_m']} м<br>"
+
         popup_html = f"""
         <div style='font-family: sans-serif; width: 230px;'>
             <h4 style='margin:0 0 5px 0; color:#d9534f;'>Ціль #{idx} (Бал: {pt['score']}%)</h4>
@@ -858,6 +922,7 @@ def get_map(
             <b>Висота над низиною:</b> +{pt['delta_h_m']} м<br>
             <b>Абс. висота:</b> {pt['elevation_m']} м<br>
             <b>До річки/заплави:</b> ~{pt['dist_water_m']} м<br>
+            {spring_line}
             <b>Схил / Сонце:</b> {pt['aspect_deg']}° ({int(pt['sun_score'] * 100)}%)
         </div>
         """
@@ -872,33 +937,35 @@ def get_map(
             popup=folium.Popup(popup_html, max_width=260),
         ).add_to(m)
 
-    harvest_overlay = build_harvest_overlay(round(lat, 5), round(lon, 5), round(radius_km, 2))
-    if harvest_overlay is not None:
-        lat_delta = radius_km / 111.0
-        lon_delta = radius_km / (111.0 * math.cos(math.radians(lat)))
-        ImageOverlay(
-            image=harvest_overlay,
-            bounds=[[lat - lat_delta, lon - lon_delta], [lat + lat_delta, lon + lon_delta]],
-            opacity=1.0,
-            name="🌾 Скошені/зібрані ділянки (падіння NDVI від піку)",
-        ).add_to(m)
+    if show_harvest:
+        harvest_overlay = build_harvest_overlay(round(lat, 5), round(lon, 5), round(radius_km, 2))
+        if harvest_overlay is not None:
+            lat_delta = radius_km / 111.0
+            lon_delta = radius_km / (111.0 * math.cos(math.radians(lat)))
+            ImageOverlay(
+                image=harvest_overlay,
+                bounds=[[lat - lat_delta, lon - lon_delta], [lat + lat_delta, lon + lon_delta]],
+                opacity=1.0,
+                name="🌾 Скошені/зібрані ділянки (падіння NDVI від піку)",
+            ).add_to(m)
 
-    ravine_heads, ravine_segments = analyze_ravines(round(lat, 5), round(lon, 5), round(radius_km, 2))
-    ravine_fg = folium.FeatureGroup(name="🏞️ Яри/струмки (реконструкція стоку)")
-    for p1, p2 in ravine_segments:
-        folium.PolyLine([p1, p2], color="#1f78ff", weight=2, opacity=0.55).add_to(ravine_fg)
-    for h in ravine_heads:
-        folium.CircleMarker(
-            location=[h["lat"], h["lon"]],
-            radius=5,
-            color="#00bcd4",
-            fill=True,
-            fill_color="#00bcd4",
-            fill_opacity=0.95,
-            popup=f"Ймовірний початок яру / джерело<br>Висота: {h['elevation_m']} м",
-            tooltip="Джерело / початок яру",
-        ).add_to(ravine_fg)
-    ravine_fg.add_to(m)
+    if show_ravines:
+        ravine_heads, ravine_segments = analyze_ravines(round(lat, 5), round(lon, 5), round(radius_km, 2))
+        ravine_fg = folium.FeatureGroup(name="🏞️ Яри/струмки (реконструкція стоку)")
+        for p1, p2 in ravine_segments:
+            folium.PolyLine([p1, p2], color="#1f78ff", weight=2, opacity=0.55).add_to(ravine_fg)
+        for h in ravine_heads:
+            folium.CircleMarker(
+                location=[h["lat"], h["lon"]],
+                radius=5,
+                color="#00bcd4",
+                fill=True,
+                fill_color="#00bcd4",
+                fill_opacity=0.95,
+                popup=f"Ймовірний початок яру / джерело<br>Висота: {h['elevation_m']} м",
+                tooltip="Джерело / початок яру",
+            ).add_to(ravine_fg)
+        ravine_fg.add_to(m)
 
     folium.LayerControl(collapsed=False).add_to(m)
     return m._repr_html_()
