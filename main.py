@@ -1,5 +1,6 @@
 import os
 import math
+from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 
 import numpy as np
@@ -31,6 +32,24 @@ MAX_GRID_STEPS = 160    # жорсткий стеля, щоб запит зав�
 # Якщо змінна не задана — використовується запасний шар NASA GIBS MODIS NDVI (250-500 м/піксель,
 # помітно грубіший, зате не вимагає реєстрації).
 COPERNICUS_INSTANCE_ID = os.environ.get("COPERNICUS_INSTANCE_ID", "").strip()
+
+# ID вашого кастомного evalscript-шару (створюється вручну в Configuration Utility —
+# див. інструкцію в чаті). За замовчуванням очікується назва MOWN_DETECT, але можна
+# перейменувати через змінну середовища, якщо назвали шар інакше.
+COPERNICUS_MOWN_LAYER = os.environ.get("COPERNICUS_MOWN_LAYER", "MOWN_DETECT").strip()
+
+# Скільки днів назад шукати безхмарний знімок. Sentinel-2 пролітає над однією точкою
+# приблизно раз на 5 днів — 60-денне вікно майже завжди дає хоча б один прийнятний кадр,
+# а WMS сам обере найсвіжіший (PRIORITY=mostRecent) серед тих, де хмарність <= MAX_CLOUD_PCT.
+CLOUD_SEARCH_WINDOW_DAYS = 60
+MAX_CLOUD_PCT = 20
+
+
+def sentinel_time_range() -> str:
+    """Діапазон часу для WMS TIME-параметра: останні CLOUD_SEARCH_WINDOW_DAYS днів."""
+    end = datetime.now(timezone.utc).date()
+    start = end - timedelta(days=CLOUD_SEARCH_WINDOW_DAYS)
+    return f"{start.isoformat()}/{end.isoformat()}"
 
 app = FastAPI(title="GeoPredict API (КР + WMS NDVI)")
 
@@ -340,17 +359,39 @@ def get_map(
     ).add_to(m)
 
     if COPERNICUS_INSTANCE_ID:
-        # Чіткий NDVI Sentinel-2 (10 м/піксель) через Copernicus Data Space / Sentinel Hub.
-        # Потребує заздалегідь створеного layer'а "NDVI" у вашій конфігурації на dataspace.copernicus.eu.
+        sh_url = f"https://sh.dataspace.copernicus.eu/ogc/wms/{COPERNICUS_INSTANCE_ID}"
+        time_range = sentinel_time_range()
+
+        # Чіткий NDVI Sentinel-2 (10 м/піксель), автоматично бере найсвіжіший
+        # безхмарний знімок з вікна CLOUD_SEARCH_WINDOW_DAYS.
         WmsTileLayer(
-            url=f"https://sh.dataspace.copernicus.eu/ogc/wms/{COPERNICUS_INSTANCE_ID}",
-            layers="NDVI",
+            url=sh_url,
+            layers="VEGETATION_INDEX",
             name="🌱 NDVI Sentinel-2 (Copernicus, 10м)",
             fmt="image/png",
             transparent=True,
             overlay=True,
             opacity=0.75,
             attr="Copernicus Sentinel Data / Sentinel Hub",
+            TIME=time_range,
+            PRIORITY="mostRecent",
+            MAXCC=MAX_CLOUD_PCT,
+        ).add_to(m)
+
+        # Кастомний шар: показує ТІЛЬКИ плями, схожі на щойно скошені/зібрані ділянки
+        # (evalscript MOWN_DETECT — треба створити вручну в Configuration Utility).
+        WmsTileLayer(
+            url=sh_url,
+            layers=COPERNICUS_MOWN_LAYER,
+            name="🌾 Скошені/зібрані ділянки (Copernicus)",
+            fmt="image/png",
+            transparent=True,
+            overlay=True,
+            opacity=0.9,
+            attr="Copernicus Sentinel Data / Sentinel Hub",
+            TIME=time_range,
+            PRIORITY="mostRecent",
+            MAXCC=MAX_CLOUD_PCT,
         ).add_to(m)
     else:
         # Запасний варіант без реєстрації — грубіший (250-500 м/піксель).
