@@ -649,6 +649,115 @@ def get_ravines_for_area(lat: float, lon: float, radius_km: float):
     return _live_analyze_ravines(lat, lon, radius_km)
 
 
+# --------------------------------------------------------------------------
+# Пошук ложбин для напівземлянок біля витоків яруг
+# --------------------------------------------------------------------------
+# Не весь загальний скан тераси, а ПРИЦІЛЬНИЙ пошук у безпосередній
+# близькості (до ~150 м) від кожного вже знайденого витоку яру/джерела:
+# невеличкий "кишеньковий" закуток, трохи вище джерела, захищений
+# рельєфом від холодних вітрів (Пн/ПнСх/Сх) — типове місце напівземлянки.
+
+HOLLOW_SEARCH_RADIUS_M = 150.0
+HOLLOW_MAX_HEIGHT_ABOVE_SPRING_M = 6.0
+HOLLOW_MIN_SCORE = 40.0
+WIND_COLD_DIRS = [(1, 0), (1, 1), (0, 1)]  # grid-напрямки: r+1=Північ, c+1=Схід → Пн, ПнСх, Сх
+
+
+def score_wind_shelter(grid: np.ndarray, r: int, c: int, cell_size_m: float, check_radius_m: float = 120.0) -> float:
+    """
+    Природний захист від холодних вітрів (Пн/ПнСх/Сх): чи є підвищення
+    рельєфу в цих напрямках поблизу. Відкритість на Пд/ПдЗ (до долини/сонця)
+    не карається — навпаки, це якраз бажано.
+    """
+    rows, cols = grid.shape
+    z = grid[r, c]
+    check_cells = max(1, int(check_radius_m / cell_size_m))
+    protected = 0
+
+    for dr, dc in WIND_COLD_DIRS:
+        max_rise = 0.0
+        for step in range(1, check_cells + 1):
+            nr, nc = r + dr * step, c + dc * step
+            if 0 <= nr < rows and 0 <= nc < cols:
+                max_rise = max(max_rise, float(grid[nr, nc]) - float(z))
+        if max_rise >= 2.5:  # відчутне підвищення — природний вітрозахист
+            protected += 1
+
+    return protected / len(WIND_COLD_DIRS)
+
+
+def find_ravine_head_hollows(grid: np.ndarray, lats: np.ndarray, lons: np.ndarray,
+                              cell_size_m: float, head_indices: tuple):
+    """Для кожного витоку яру шукає найкращу сусідню ложбину під напівземлянку."""
+    rows, cols = grid.shape
+    search_cells = max(2, int(HOLLOW_SEARCH_RADIUS_M / cell_size_m))
+    hollows = []
+
+    for hr, hc in head_indices:
+        head_z = float(grid[hr, hc])
+        best = None
+
+        for dr in range(-search_cells, search_cells + 1):
+            for dc in range(-search_cells, search_cells + 1):
+                r, c = hr + dr, hc + dc
+                if not (3 <= r < rows - 3 and 3 <= c < cols - 3):
+                    continue
+                dist_m = math.sqrt((dr * cell_size_m) ** 2 + (dc * cell_size_m) ** 2)
+                if dist_m < 10.0 or dist_m > HOLLOW_SEARCH_RADIUS_M:
+                    continue
+
+                z = float(grid[r, c])
+                delta_h = z - head_z
+                if delta_h < 0.0 or delta_h > HOLLOW_MAX_HEIGHT_ABOVE_SPRING_M:
+                    continue
+
+                slope_deg, aspect_deg, _ = calc_geomorphology(grid, r, c, cell_size_m)
+                if slope_deg > 10.0:
+                    continue
+
+                s_slope = score_slope_chernyakhiv(slope_deg)
+                s_sun = score_sun_chernyakhiv(aspect_deg)
+                s_wind = score_wind_shelter(grid, r, c, cell_size_m)
+                s_close = max(0.0, 1.0 - dist_m / HOLLOW_SEARCH_RADIUS_M)
+                s_height = max(0.0, 1.0 - delta_h / HOLLOW_MAX_HEIGHT_ABOVE_SPRING_M)
+
+                hollow_score = (
+                    0.30 * s_wind +
+                    0.25 * s_close +
+                    0.20 * s_height +
+                    0.15 * s_slope +
+                    0.10 * s_sun
+                ) * 100
+
+                if best is None or hollow_score > best["score"]:
+                    best = {
+                        "lat": round(float(lats[r]), 5),
+                        "lon": round(float(lons[c]), 5),
+                        "score": round(float(hollow_score), 1),
+                        "dist_to_spring_m": round(dist_m),
+                        "delta_h_above_spring_m": round(float(delta_h), 1),
+                        "slope_deg": round(float(slope_deg), 1),
+                        "aspect_deg": round(float(aspect_deg), 1),
+                        "wind_shelter": round(float(s_wind), 2),
+                        "spring_lat": round(float(lats[hr]), 5),
+                        "spring_lon": round(float(lons[hc]), 5),
+                    }
+
+        if best is not None and best["score"] >= HOLLOW_MIN_SCORE:
+            hollows.append(best)
+
+    return hollows
+
+
+@lru_cache(maxsize=32)
+def get_hollows_for_area(lat: float, lon: float, radius_km: float):
+    """Кешовано: ложбини для напівземлянок біля кожного витоку яру в зоні пошуку."""
+    grid, lats, lons, cell_size_m = get_grid_bundle(lat, lon, radius_km)
+    head_indices = get_channel_head_indices_for_scoring(lat, lon, radius_km, grid, lats, lons)
+    hollows = find_ravine_head_hollows(grid, lats, lons, cell_size_m, head_indices)
+    return tuple(hollows)
+
+
 @lru_cache(maxsize=64)
 def run_analysis(lat: float, lon: float, radius_km: float, culture: str = "kr") -> tuple:
     """Кешований аналіз. culture: 'kr' (Київська Русь), 'cherniakhiv' або 'both'."""
@@ -841,6 +950,26 @@ def api_inspect(
     return {"points": out}
 
 
+@app.get("/api/hollows")
+def api_hollows(
+    lat: float = Query(50.75, ge=-85, le=85),
+    lon: float = Query(33.47, ge=-180, le=180),
+    radius_km: float = Query(5.0, ge=MIN_RADIUS_KM, le=MAX_RADIUS_KM),
+):
+    """
+    Ложбини для напівземлянок біля витоків яруг — прицільний пошук у радіусі
+    150м навколо кожного джерела: невисоко над водою, захищено від холодних
+    вітрів (Пн/ПнСх/Сх), полога ділянка.
+    """
+    hollows = get_hollows_for_area(round(lat, 5), round(lon, 5), round(radius_km, 2))
+    return {
+        "center": {"lat": lat, "lon": lon},
+        "radius_km": radius_km,
+        "count": len(hollows),
+        "hollows": list(hollows),
+    }
+
+
 @app.get("/api/ravines")
 def api_ravines(
     lat: float = Query(50.75, ge=-85, le=85),
@@ -910,7 +1039,7 @@ def api_analyze(
     }
 
 
-@app.get("/map", response_class=HTMLResponse)
+@app.api_route("/map", methods=["GET", "HEAD"], response_class=HTMLResponse)
 def get_map(
     lat: float = Query(50.75, ge=-85, le=85),
     lon: float = Query(33.47, ge=-180, le=180),
@@ -1076,6 +1205,26 @@ def get_map(
                 tooltip="Джерело / початок яру",
             ).add_to(ravine_fg)
         ravine_fg.add_to(m)
+
+        hollows = get_hollows_for_area(round(lat, 5), round(lon, 5), round(radius_km, 2))
+        hollow_fg = folium.FeatureGroup(name="🏚️ Ложбини для напівземлянок")
+        for h in hollows:
+            popup_html = f"""
+            <div style='font-family: sans-serif; width: 220px;'>
+                <h4 style='margin:0 0 5px 0; color:#8d6e63;'>Ложбина (Бал: {h['score']}%)</h4>
+                <b>До джерела:</b> {h['dist_to_spring_m']} м<br>
+                <b>Вище джерела на:</b> {h['delta_h_above_spring_m']} м<br>
+                <b>Схил:</b> {h['slope_deg']}°<br>
+                <b>Захист від вітру:</b> {int(h['wind_shelter'] * 100)}%
+            </div>
+            """
+            folium.Marker(
+                location=[h["lat"], h["lon"]],
+                icon=folium.Icon(color="beige", icon="home", prefix="fa"),
+                popup=folium.Popup(popup_html, max_width=250),
+                tooltip=f"Ложбина під напівземлянку (Бал: {h['score']}%)",
+            ).add_to(hollow_fg)
+        hollow_fg.add_to(m)
 
     folium.LayerControl(collapsed=False).add_to(m)
     return m._repr_html_()
