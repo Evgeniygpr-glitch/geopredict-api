@@ -1,12 +1,15 @@
 import os
 import math
+import io
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 
 import numpy as np
+import requests
+from PIL import Image
 import srtm
 import folium
-from folium.raster_layers import WmsTileLayer
+from folium.raster_layers import WmsTileLayer, ImageOverlay
 from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -37,6 +40,19 @@ COPERNICUS_INSTANCE_ID = os.environ.get("COPERNICUS_INSTANCE_ID", "").strip()
 # див. інструкцію в чаті). За замовчуванням очікується назва MOWN_DETECT, але можна
 # перейменувати через змінну середовища, якщо назвали шар інакше.
 COPERNICUS_MOWN_LAYER = os.environ.get("COPERNICUS_MOWN_LAYER", "HARVESTED-FIELDS").strip()
+COPERNICUS_NDVI_RAW_LAYER = os.environ.get("COPERNICUS_NDVI_RAW_LAYER", "NDVI_RAW").strip()
+
+# Розмір боку зображення для порівняння пік-вегетації/поточного стану (px).
+# Обмежено заради швидкості й розміру відповіді Render.
+HARVEST_OVERLAY_MAX_PX = 500
+
+# Вікна (днів тому) для знімків: перше — поточний стан, решта — історія для пошуку піку вегетації.
+HARVEST_SNAPSHOT_WINDOWS_DAYS = [
+    (0, 30),      # поточний стан
+    (45, 75),
+    (90, 120),
+    (135, 165),   # ширше вікно — шанс захопити пік вегетації перед збором урожаю
+]
 
 # Скільки днів назад шукати безхмарний знімок. Sentinel-2 пролітає над однією точкою
 # приблизно раз на 5 днів — 60-денне вікно майже завжди дає хоча б один прийнятний кадр,
@@ -51,6 +67,105 @@ def sentinel_time_range(days: int = CLOUD_SEARCH_WINDOW_DAYS) -> str:
     end = datetime.now(timezone.utc).date()
     start = end - timedelta(days=days)
     return f"{start.isoformat()}/{end.isoformat()}"
+
+
+def _fetch_ndvi_snapshot(sh_url: str, bbox, width: int, height: int, days_from: int, days_to: int):
+    """
+    Один WMS GetMap запит до шару NDVI_RAW за вікно [days_to; days_from] днів тому.
+    Повертає (ndvi_array, valid_mask) або None, якщо запит не вдався чи немає безхмарного знімка.
+    """
+    end = datetime.now(timezone.utc).date() - timedelta(days=days_from)
+    start = datetime.now(timezone.utc).date() - timedelta(days=days_to)
+    time_range = f"{start.isoformat()}/{end.isoformat()}"
+
+    params = {
+        "SERVICE": "WMS",
+        "REQUEST": "GetMap",
+        "VERSION": "1.1.1",
+        "LAYERS": COPERNICUS_NDVI_RAW_LAYER,
+        "SRS": "EPSG:4326",
+        "BBOX": f"{bbox[0]},{bbox[1]},{bbox[2]},{bbox[3]}",
+        "WIDTH": width,
+        "HEIGHT": height,
+        "FORMAT": "image/png",
+        "TRANSPARENT": "true",
+        "TIME": time_range,
+        "PRIORITY": "mostRecent",
+        "MAXCC": 30,
+    }
+
+    try:
+        resp = requests.get(sh_url, params=params, timeout=25)
+        resp.raise_for_status()
+        img = Image.open(io.BytesIO(resp.content)).convert("LA")
+        arr = np.array(img)
+        gray = arr[..., 0].astype(np.float32)
+        alpha = arr[..., 1]
+        ndvi = gray / 127.5 - 1.0
+        valid = alpha > 200
+        return ndvi, valid
+    except Exception as exc:
+        print(f"[harvest_overlay] Не вдалось отримати знімок ({days_from}-{days_to} днів тому): {exc}")
+        return None
+
+
+@lru_cache(maxsize=16)
+def build_harvest_overlay(lat: float, lon: float, radius_km: float):
+    """
+    Порівнює пік вегетації (за останні ~5.5 міс) з поточним станом і повертає
+    RGBA numpy-масив, де підсвічено ТІЛЬКИ ділянки з різким падінням NDVI —
+    типова ознака недавнього збору врожаю/скошування. Гола земля, яка й раніше
+    була голою (низький NDVI в усіх знімках), під умову не потрапляє.
+    Повертає None, якщо дані недоступні (немає Instance ID, мережева помилка,
+    немає жодного придатного безхмарного знімка).
+    """
+    if not COPERNICUS_INSTANCE_ID:
+        return None
+
+    sh_url = f"https://sh.dataspace.copernicus.eu/ogc/wms/{COPERNICUS_INSTANCE_ID}"
+
+    lat_delta = radius_km / 111.0
+    lon_delta = radius_km / (111.0 * math.cos(math.radians(lat)))
+    bbox = (lon - lon_delta, lat - lat_delta, lon + lon_delta, lat + lat_delta)  # minx,miny,maxx,maxy
+
+    side_m = 2 * radius_km * 1000.0
+    px = max(200, min(HARVEST_OVERLAY_MAX_PX, int(side_m / 25)))
+
+    snapshots = [
+        _fetch_ndvi_snapshot(sh_url, bbox, px, px, days_from, days_to)
+        for days_from, days_to in HARVEST_SNAPSHOT_WINDOWS_DAYS
+    ]
+
+    current = snapshots[0]
+    history = [s for s in snapshots[1:] if s is not None]
+
+    if current is None:
+        print("[harvest_overlay] Немає поточного (0-30 днів) знімка — пропускаю шар.")
+        return None
+    if not history:
+        print("[harvest_overlay] Немає жодного історичного знімка для порівняння — пропускаю шар.")
+        return None
+
+    current_ndvi, current_valid = current
+
+    peak_ndvi = np.full_like(current_ndvi, -1.0)
+    peak_valid = np.zeros_like(current_valid)
+    for ndvi, valid in history:
+        take = valid & (ndvi > peak_ndvi)
+        peak_ndvi = np.where(take, ndvi, peak_ndvi)
+        peak_valid = peak_valid | valid
+
+    harvested = (
+        current_valid & peak_valid &
+        (peak_ndvi > 0.4) &          # раніше там точно щось росло
+        (current_ndvi < 0.3) &       # зараз низька рослинність
+        ((peak_ndvi - current_ndvi) > 0.2)  # суттєве падіння
+    )
+
+    h, w = harvested.shape
+    overlay = np.zeros((h, w, 4), dtype=np.uint8)
+    overlay[harvested] = [255, 140, 0, 200]  # помаранчевий, напівпрозорий; решта лишається прозорою
+    return overlay
 
 app = FastAPI(title="GeoPredict API (КР + WMS NDVI)")
 
@@ -379,21 +494,6 @@ def get_map(
             MAXCC=MAX_CLOUD_PCT,
         ).add_to(m)
 
-        # Кастомний шар: показує ТІЛЬКИ плями, схожі на щойно скошені/зібрані ділянки
-        # (evalscript HARVESTED-FIELDS — порівнює пік вегетації з поточним станом,
-        # тому не плутає скошене з голою землею, яка й раніше не зеленіла).
-        WmsTileLayer(
-            url=sh_url,
-            layers=COPERNICUS_MOWN_LAYER,
-            name="🌾 Скошені/зібрані ділянки (Copernicus)",
-            fmt="image/png",
-            transparent=True,
-            overlay=True,
-            opacity=0.9,
-            attr="Copernicus Sentinel Data / Sentinel Hub",
-            TIME=sentinel_time_range(HARVEST_DETECT_WINDOW_DAYS),
-            MAXCC=MAX_CLOUD_PCT,
-        ).add_to(m)
     else:
         # Запасний варіант без реєстрації — грубіший (250-500 м/піксель).
         WmsTileLayer(
@@ -463,6 +563,17 @@ def get_map(
             fill_color=color,
             fill_opacity=0.9,
             popup=folium.Popup(popup_html, max_width=260),
+        ).add_to(m)
+
+    harvest_overlay = build_harvest_overlay(round(lat, 5), round(lon, 5), round(radius_km, 2))
+    if harvest_overlay is not None:
+        lat_delta = radius_km / 111.0
+        lon_delta = radius_km / (111.0 * math.cos(math.radians(lat)))
+        ImageOverlay(
+            image=harvest_overlay,
+            bounds=[[lat - lat_delta, lon - lon_delta], [lat + lat_delta, lon + lon_delta]],
+            opacity=1.0,
+            name="🌾 Скошені/зібрані ділянки (падіння NDVI від піку)",
         ).add_to(m)
 
     folium.LayerControl(collapsed=False).add_to(m)
