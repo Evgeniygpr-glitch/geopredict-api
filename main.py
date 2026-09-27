@@ -42,13 +42,14 @@ COPERNICUS_MOWN_LAYER = os.environ.get("COPERNICUS_MOWN_LAYER", "HARVESTED-FIELD
 # приблизно раз на 5 днів — 60-денне вікно майже завжди дає хоча б один прийнятний кадр,
 # а WMS сам обере найсвіжіший (PRIORITY=mostRecent) серед тих, де хмарність <= MAX_CLOUD_PCT.
 CLOUD_SEARCH_WINDOW_DAYS = 60
+HARVEST_DETECT_WINDOW_DAYS = 150  # ширше вікно — треба захопити пік вегетації ДО збору врожаю
 MAX_CLOUD_PCT = 20
 
 
-def sentinel_time_range() -> str:
-    """Діапазон часу для WMS TIME-параметра: останні CLOUD_SEARCH_WINDOW_DAYS днів."""
+def sentinel_time_range(days: int = CLOUD_SEARCH_WINDOW_DAYS) -> str:
+    """Діапазон часу для WMS TIME-параметра: останні `days` днів."""
     end = datetime.now(timezone.utc).date()
-    start = end - timedelta(days=CLOUD_SEARCH_WINDOW_DAYS)
+    start = end - timedelta(days=days)
     return f"{start.isoformat()}/{end.isoformat()}"
 
 app = FastAPI(title="GeoPredict API (КР + WMS NDVI)")
@@ -379,7 +380,8 @@ def get_map(
         ).add_to(m)
 
         # Кастомний шар: показує ТІЛЬКИ плями, схожі на щойно скошені/зібрані ділянки
-        # (evalscript MOWN_DETECT — треба створити вручну в Configuration Utility).
+        # (evalscript HARVESTED-FIELDS — порівнює пік вегетації з поточним станом,
+        # тому не плутає скошене з голою землею, яка й раніше не зеленіла).
         WmsTileLayer(
             url=sh_url,
             layers=COPERNICUS_MOWN_LAYER,
@@ -389,8 +391,7 @@ def get_map(
             overlay=True,
             opacity=0.9,
             attr="Copernicus Sentinel Data / Sentinel Hub",
-            TIME=time_range,
-            PRIORITY="mostRecent",
+            TIME=sentinel_time_range(HARVEST_DETECT_WINDOW_DAYS),
             MAXCC=MAX_CLOUD_PCT,
         ).add_to(m)
     else:
