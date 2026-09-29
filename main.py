@@ -2,6 +2,9 @@ import os
 import math
 import io
 import json
+import time
+import uuid
+import threading
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 
@@ -12,7 +15,7 @@ import srtm
 import folium
 from folium.raster_layers import WmsTileLayer, ImageOverlay
 from fastapi import FastAPI, Query
-from fastapi.responses import HTMLResponse, Response
+from fastapi.responses import HTMLResponse, Response, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 # --------------------------------------------------------------------------
@@ -679,6 +682,155 @@ def get_ravines_for_area(lat: float, lon: float, radius_km: float):
         return heads, segments
 
     return _live_analyze_ravines(lat, lon, radius_km)
+
+
+# --------------------------------------------------------------------------
+# Масове прекомп'ютування всієї Сумської області ОДНІЄЮ кнопкою
+# --------------------------------------------------------------------------
+# Рахує всі 9 плиток (50 км кожна, з перекриттям) у ФОНОВОМУ потоці — тому
+# HTTP-запит не висне і не впирається в таймаут Render, скільки б це не
+# тривало. Сторінка /precompute сама опитує прогрес і показує посилання
+# на завантаження готового ОДНОГО файлу, коли все готово.
+
+SUMY_OBLAST_TILES = [
+    (50.225, 32.958), (50.225, 34.032), (50.225, 35.105),
+    (50.901, 32.958), (50.901, 34.032), (50.901, 35.105),
+    (51.577, 32.958), (51.577, 34.032), (51.577, 35.105),
+]
+PRECOMPUTE_TILE_RADIUS_KM = 50.0
+
+_precompute_job = {"status": "idle", "stage": "", "tiles": [], "error": None}
+_precompute_lock = threading.Lock()
+
+
+def _run_precompute_all():
+    global _precompute_job
+    try:
+        tiles_out = []
+        total = len(SUMY_OBLAST_TILES)
+        for i, (t_lat, t_lon) in enumerate(SUMY_OBLAST_TILES, 1):
+            with _precompute_lock:
+                _precompute_job["stage"] = f"Плитка {i}/{total} ({t_lat}, {t_lon})… це повільно, чекайте"
+            heads, segments = _live_analyze_ravines(t_lat, t_lon, PRECOMPUTE_TILE_RADIUS_KM)
+            min_lat, max_lat, min_lon, max_lon = _bbox(t_lat, t_lon, PRECOMPUTE_TILE_RADIUS_KM)
+            tiles_out.append({
+                "center": {"lat": t_lat, "lon": t_lon},
+                "radius_km": PRECOMPUTE_TILE_RADIUS_KM,
+                "bounds": {"min_lat": min_lat, "max_lat": max_lat, "min_lon": min_lon, "max_lon": max_lon},
+                "heads": list(heads),
+                "segments": [list(s) for s in segments],
+            })
+            with _precompute_lock:
+                _precompute_job["tiles"] = tiles_out  # проміжний прогрес теж зберігаємо
+
+        with _precompute_lock:
+            _precompute_job["status"] = "done"
+            _precompute_job["stage"] = "Готово! Натисніть 'Завантажити файл'."
+    except Exception as exc:
+        print(f"[precompute_all] Помилка: {exc}")
+        with _precompute_lock:
+            _precompute_job["status"] = "error"
+            _precompute_job["error"] = str(exc)
+
+
+@app.get("/api/precompute_all/start")
+def precompute_all_start():
+    with _precompute_lock:
+        if _precompute_job["status"] == "running":
+            return {"status": "running", "stage": _precompute_job["stage"]}
+        _precompute_job.update(status="running", stage="Запуск…", tiles=[], error=None)
+    threading.Thread(target=_run_precompute_all, daemon=True).start()
+    return {"status": "running"}
+
+
+@app.get("/api/precompute_all/status")
+def precompute_all_status():
+    with _precompute_lock:
+        return {
+            "status": _precompute_job["status"],
+            "stage": _precompute_job["stage"],
+            "error": _precompute_job["error"],
+            "tiles_done": len(_precompute_job["tiles"]),
+            "tiles_total": len(SUMY_OBLAST_TILES),
+        }
+
+
+@app.get("/api/precompute_all/download")
+def precompute_all_download():
+    with _precompute_lock:
+        if _precompute_job["status"] != "done":
+            return JSONResponse({"detail": "Ще не готово, зачекайте завершення."}, status_code=409)
+        payload = {"tiles": _precompute_job["tiles"]}
+
+    return Response(
+        content=json.dumps(payload, ensure_ascii=False),
+        media_type="application/json",
+        headers={"Content-Disposition": "attachment; filename=precomputed_ravines.json"},
+    )
+
+
+PRECOMPUTE_PAGE_HTML = """<!DOCTYPE html>
+<html lang="uk"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Прекомп'ютування всієї області</title>
+<style>
+body{font-family:system-ui,sans-serif;max-width:600px;margin:0 auto;padding:16px;line-height:1.5}
+button{padding:14px 18px;font-size:17px;width:100%;margin:8px 0}
+#status{padding:12px;border-radius:8px;background:rgba(127,127,127,.15);margin-top:10px}
+#status.err{background:rgba(220,50,50,.2)}
+#dl{display:none;text-align:center;padding:14px;background:#2f9e44;color:#fff;
+    border-radius:8px;text-decoration:none;font-weight:bold;margin-top:10px}
+</style></head><body>
+<h2>🗺️ Прекомп'ютування всієї Сумської області</h2>
+<p>Порахує всі 9 плиток (по 50 км) одним натисканням. Це триває кілька хвилин —
+можна закрити екран, прогрес зберігається на сервері.</p>
+<button onclick="start()">▶️ Почати обчислення</button>
+<div id="status">Натисніть кнопку вище.</div>
+<a id="dl" href="/api/precompute_all/download">⬇️ Завантажити готовий файл precomputed_ravines.json</a>
+
+<script>
+const st = document.getElementById('status');
+const dl = document.getElementById('dl');
+
+async function start(){
+  st.className = ''; dl.style.display = 'none';
+  st.textContent = 'Запускаю…';
+  await fetch('/api/precompute_all/start');
+  poll();
+}
+
+async function poll(){
+  for (let i = 0; i < 400; i++) {
+    let s;
+    try { s = await (await fetch('/api/precompute_all/status')).json(); }
+    catch(e){ st.textContent = 'Втрачено звʼязок, пробую ще…'; await new Promise(r=>setTimeout(r,4000)); continue; }
+
+    if (s.status === 'done') {
+      st.textContent = '✅ Готово! (' + s.tiles_done + '/' + s.tiles_total + ' плиток)';
+      dl.style.display = 'block';
+      return;
+    }
+    if (s.status === 'error') {
+      st.className = 'err';
+      st.textContent = '❌ Помилка: ' + s.error;
+      return;
+    }
+    st.textContent = '⏳ ' + s.stage + '  [' + s.tiles_done + '/' + s.tiles_total + ']';
+    await new Promise(r => setTimeout(r, 4000));
+  }
+  st.textContent = 'Занадто довго — оновіть сторінку.';
+}
+
+// якщо задача вже йшла — одразу підхопити прогрес
+poll();
+</script></body></html>"""
+
+
+@app.get("/precompute", response_class=HTMLResponse)
+def precompute_page():
+    return PRECOMPUTE_PAGE_HTML
+
+
 
 
 # --------------------------------------------------------------------------
