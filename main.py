@@ -219,6 +219,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Публічна адреса сервісу — для посилань усередині карти (вона рендериться в iframe,
+# тому відносні посилання не працюють). Можна перекрити змінною PUBLIC_BASE_URL.
+PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "https://geopredict-api.onrender.com").rstrip("/")
+
+# AI-дослідження зони (окремий файл research.py). Якщо файлу немає на GitHub —
+# решта застосунку працює як раніше, просто без цього розділу.
+try:
+    from research import router as research_router
+    app.include_router(research_router)
+    print("[research] Модуль AI-дослідження підключено.")
+except Exception as exc:
+    print(f"[research] Модуль не підключено: {exc}")
+
 # Ліниве завантаження — щоб /  та /docs відповідали миттєво,
 # навіть якщо мережа до джерела SRTM тимчасово недоступна.
 _elevation_data = None
@@ -1133,17 +1146,6 @@ def get_map(
             attr="NASA GIBS / EOSDIS",
         ).add_to(m)
 
-    WmsTileLayer(
-        url="https://gibs.earthdata.nasa.gov/wms/epsg3857/best/wms.cgi",
-        layers="MODIS_Terra_CorrectedReflectance_Bands721",
-        name="🌾 Контраст полів (False Color 7-2-1)",
-        fmt="image/jpeg",
-        transparent=False,
-        overlay=True,
-        opacity=0.65,
-        attr="NASA GIBS / EOSDIS",
-    ).add_to(m)
-
     folium.Circle(
         location=[lat, lon],
         radius=radius_km * 1000,
@@ -1156,9 +1158,14 @@ def get_map(
         tooltip=f"Радіус аналізу {radius_km} км",
     ).add_to(m)
 
+    center_research_url = f"{PUBLIC_BASE_URL}/research?lat={lat}&lon={lon}&radius_km={min(radius_km, 15.0)}"
     folium.Marker(
         [lat, lon],
-        popup=f"Центр аналізу КР ({lat:.5f}, {lon:.5f})",
+        popup=folium.Popup(
+            f"Центр аналізу ({lat:.5f}, {lon:.5f})<br>"
+            f"<a href='{center_research_url}' target='_blank'>🔎 Що писали про цю зону (AI)</a>",
+            max_width=260,
+        ),
         icon=folium.Icon(color="black", icon="info-sign"),
     ).add_to(m)
 
@@ -1187,6 +1194,8 @@ def get_map(
         if pt.get("dist_hollow_m") is not None:
             hollow_line = f"<b>До ложбини під напівземлянку:</b> ~{pt['dist_hollow_m']} м<br>"
 
+        research_url = f"{PUBLIC_BASE_URL}/research?lat={pt['lat']}&lon={pt['lon']}&radius_km=3"
+
         popup_html = f"""
         <div style='font-family: sans-serif; width: 230px;'>
             <h4 style='margin:0 0 5px 0; color:#d9534f;'>Ціль #{idx} (Бал: {pt['score']}%)</h4>
@@ -1196,7 +1205,8 @@ def get_map(
             <b>До річки/заплави:</b> ~{pt['dist_water_m']} м<br>
             {spring_line}
             {hollow_line}
-            <b>Схил / Сонце:</b> {pt['aspect_deg']}° ({int(pt['sun_score'] * 100)}%)
+            <b>Схил / Сонце:</b> {pt['aspect_deg']}° ({int(pt['sun_score'] * 100)}%)<br>
+            <a href='{research_url}' target='_blank'>🔎 Що писали про це місце (AI)</a>
         </div>
         """
 
@@ -1261,4 +1271,11 @@ def get_map(
         hollow_fg.add_to(m)
 
     folium.LayerControl(collapsed=False).add_to(m)
-    return m._repr_html_()
+    html = m.get_root().render()
+    mobile_fix = (
+        '<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">\n'
+        "<style>html,body{margin:0;padding:0;width:100%;height:100%;} "
+        ".folium-map{width:100% !important;height:100% !important;}</style>\n"
+    )
+    html = html.replace("<head>", "<head>\n" + mobile_fix, 1)
+    return HTMLResponse(content=html)
