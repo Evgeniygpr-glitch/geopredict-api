@@ -1245,7 +1245,7 @@ def loading_page():
     """
 
 
-@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"])
 def read_root():
     return {"status": "GeoPredict API (КР + WMS NDVI) працює"}
 
@@ -1305,24 +1305,25 @@ def _ci_regex(text: str) -> str:
 
 
 def _overpass_places(q: str) -> list:
+    """Overpass: назви, що ПОЧИНАЮТЬСЯ з q. Короткі таймаути — повільний Overpass не має гальмувати підказки."""
     safe = re.sub(r"[^0-9A-Za-zА-Яа-яІіЇїЄєҐґʼ'’\- ]", "", q)
-    if len(safe) < 2:
+    if len(safe) < 3:
         return []
     query = (
-        '[out:json][timeout:20];'
+        '[out:json][timeout:7];'
         'nwr["place"~"^(city|town|village|hamlet|suburb|isolated_dwelling|locality)$"]'
-        f'["name"~"{_ci_regex(safe)}"]({SUMY_BBOX_OVERPASS});out center 40;'
+        f'["name"~"^{_ci_regex(safe)}"]({SUMY_BBOX_OVERPASS});out center 40;'
     )
     elements = None
     for url in _OVERPASS_URLS:
         try:
-            r = requests.post(url, data={"data": query}, timeout=25,
+            r = requests.post(url, data={"data": query}, timeout=(3, 8),
                               headers={"User-Agent": "GeoPredict/1.0"})
             r.raise_for_status()
             elements = r.json().get("elements", [])
             break
         except Exception as exc:
-            print(f"[places_search] Overpass {url}: {exc}")
+            print(f"[places_search] Overpass {url}: {type(exc).__name__}")
     out = []
     for el in elements or []:
         tags = el.get("tags", {})
@@ -1334,6 +1335,29 @@ def _overpass_places(q: str) -> list:
         name = tags["name"]
         out.append({"name": name, "kind": kind, "display_name": f"{name} ({lat:.4f}, {lon:.4f})",
                     "label": f"{_PLACE_UK.get(kind, kind)}: {name} ({lat:.3f}, {lon:.3f})",
+                    "lat": round(float(lat), 5), "lon": round(float(lon), 5)})
+    return out
+
+
+def _photon_places(q: str) -> list:
+    """Photon (komoot): пошук за ПОЧАТКОМ назви, тобто підходить для підказок під час набору."""
+    resp = requests.get(
+        "https://photon.komoot.io/api/",
+        params={"q": q, "bbox": "32.4,49.9,35.8,52.2", "limit": 15, "osm_tag": "place"},
+        headers={"User-Agent": "GeoPredict/1.0"}, timeout=(3, 7),
+    )
+    resp.raise_for_status()
+    out = []
+    for f in resp.json().get("features", []):
+        p = f.get("properties", {})
+        kind = p.get("osm_value")
+        name = p.get("name")
+        lon, lat = (f.get("geometry", {}).get("coordinates") or [None, None])[:2]
+        if kind not in _PLACE_RANK or not name or lat is None:
+            continue
+        where = ", ".join(x for x in (p.get("district") or p.get("county"), p.get("state")) if x)
+        out.append({"name": name, "kind": kind, "display_name": f"{name}, {where}" if where else name,
+                    "label": f"{_PLACE_UK.get(kind, kind)}: {name}" + (f", {where}" if where else ""),
                     "lat": round(float(lat), 5), "lon": round(float(lon), 5)})
     return out
 
@@ -1350,19 +1374,21 @@ def api_places_search(q: str = Query(..., min_length=2)):
     if q_clean.lower() in _PLACES_CACHE:
         return {"results": _PLACES_CACHE[q_clean.lower()]}
 
+    from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FTimeout
     found, errors = [], []
+    pool = ThreadPoolExecutor(max_workers=3)
+    futs = {pool.submit(fn, q_clean): name for name, fn in
+            (("Nominatim", _nominatim_places), ("Photon", _photon_places), ("Overpass", _overpass_places))}
     try:
-        found += _nominatim_places(q_clean)
-    except Exception as exc:
-        errors.append(f"Nominatim: {exc}")
-        print(f"[places_search] Nominatim: {exc}")
-
-    if len(found) < 6:  # мало результатів — добираємо з Overpass
-        try:
-            found += _overpass_places(q_clean)
-        except Exception as exc:
-            errors.append(f"Overpass: {exc}")
-            print(f"[places_search] Overpass: {exc}")
+        for fut in as_completed(futs, timeout=6):
+            try:
+                found += fut.result()
+            except Exception as exc:
+                errors.append(f"{futs[fut]}: {type(exc).__name__}")
+                print(f"[places_search] {futs[fut]}: {exc}")
+    except FTimeout:
+        print("[places_search] Дедлайн 6 с — віддаю те, що встигло.")
+    pool.shutdown(wait=False)  # не чекаємо повільні джерела
 
     seen, results = set(), []
     ql = q_clean.lower()
@@ -1475,13 +1501,16 @@ def test_form():
                 clearTimeout(searchTimer);
                 const q = $('place').value.trim();
                 if (q.length < 2) { $('suggestions').innerHTML = ''; return; }
-                searchTimer = setTimeout(() => runSearch(q), 400);
+                searchTimer = setTimeout(() => runSearch(q), 700);
             });
 
+            let searchCtl = null;
             async function runSearch(q) {
+                if (searchCtl) searchCtl.abort();
+                searchCtl = new AbortController();
                 $('suggestions').innerHTML = '<div class="muted">Шукаю…</div>';
                 try {
-                    const r = await fetch('/api/places/search?q=' + encodeURIComponent(q));
+                    const r = await fetch('/api/places/search?q=' + encodeURIComponent(q), {signal: searchCtl.signal});
                     const data = await r.json();
                     const box = $('suggestions');
                     box.innerHTML = '';
@@ -1498,6 +1527,7 @@ def test_form():
                         box.appendChild(b);
                     });
                 } catch (e) {
+                    if (e.name === 'AbortError') return;
                     $('suggestions').innerHTML = '<div class="muted">Помилка пошуку. Введіть координати вручну.</div>';
                 }
             }
