@@ -1114,7 +1114,10 @@ def test_form():
         </select>
 
         <div class="row2">
-            <div><label><input type="checkbox" id="ravines"> Яри/ложбини</label></div>
+            <div><label><input type="checkbox" id="ravines"> Яри/струмки</label></div>
+            <div><label><input type="checkbox" id="hollows"> Ложбини (будиночки)</label></div>
+        </div>
+        <div class="row2">
             <div><label><input type="checkbox" id="harvest"> Скошені поля</label></div>
         </div>
 
@@ -1171,12 +1174,12 @@ def test_form():
 
             function updateLinks() {
                 const q = `lat=${$('lat').value}&lon=${$('lon').value}&radius_km=${$('radius').value}&culture=${$('culture').value}`
-                    + `&show_ravines=${$('ravines').checked}&show_harvest=${$('harvest').checked}`;
+                    + `&show_ravines=${$('ravines').checked}&show_hollows=${$('hollows').checked}&show_harvest=${$('harvest').checked}`;
                 $('mapLink').href = `/map?${q}`;
                 $('jsonLink').href = `/api/analyze?lat=${$('lat').value}&lon=${$('lon').value}&radius_km=${$('radius').value}&culture=${$('culture').value}`;
             }
 
-            ['lat','lon','radius','culture','ravines','harvest'].forEach(id =>
+            ['lat','lon','radius','culture','ravines','hollows','harvest'].forEach(id =>
                 $(id).addEventListener('input', updateLinks)
             );
             updateLinks();
@@ -1362,7 +1365,8 @@ def get_map(
     lon: float = Query(33.47, ge=-180, le=180),
     radius_km: float = Query(10.0, ge=MIN_RADIUS_KM, le=MAX_RADIUS_KM),
     culture: str = Query("kr", pattern="^(kr|cherniakhiv|both)$"),
-    show_ravines: bool = Query(False, description="Аналіз ярів/струмків (D8) — повільно, вимкнено за замовчуванням"),
+    show_ravines: bool = Query(False, description="Яри/струмки (D8) — повільно, вимкнено за замовчуванням"),
+    show_hollows: bool = Query(False, description="Ложбини для напівземлянок біля витоків яруг"),
     show_harvest: bool = Query(False, description="Шар 'скошені поля' (4 запити до Copernicus) — повільно"),
 ):
     """HTML-мапа лишається для власного дебагу в браузері — Solar2D її не використовує."""
@@ -1532,6 +1536,7 @@ def get_map(
             ).add_to(ravine_fg)
         ravine_fg.add_to(m)
 
+    if show_hollows:
         hollows = get_hollows_for_area(round(lat, 5), round(lon, 5), round(radius_km, 2))
         hollow_fg = folium.FeatureGroup(name="🏚️ Ложбини для напівземлянок")
         for h in hollows:
