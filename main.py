@@ -143,7 +143,10 @@ def _fetch_ndvi_snapshot(sh_url: str, bbox, width: int, height: int, days_from: 
 
     try:
         resp = requests.get(sh_url, params=params, timeout=25)
-        resp.raise_for_status()
+        if resp.status_code != 200:
+            # Показуємо тіло відповіді — Sentinel Hub зазвичай пише точну причину помилки в XML.
+            print(f"[harvest_overlay] HTTP {resp.status_code} від Copernicus: {resp.text[:500]}")
+            resp.raise_for_status()
         img = Image.open(io.BytesIO(resp.content)).convert("LA")
         arr = np.array(img)
         gray = arr[..., 0].astype(np.float32)
@@ -1365,13 +1368,22 @@ def get_map(
     """HTML-мапа лишається для власного дебагу в браузері — Solar2D її не використовує."""
     results = run_analysis(round(lat, 5), round(lon, 5), round(radius_km, 2), culture)
 
+    lat_delta = radius_km / 111.0
+    lon_delta = radius_km / (111.0 * math.cos(math.radians(lat)))
+    bounds = [[lat - lat_delta, lon - lon_delta], [lat + lat_delta, lon + lon_delta]]
+
     m = folium.Map(
         location=[lat, lon],
-        zoom_start=12 if radius_km > 10 else 14,
         tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
         attr="Esri World Imagery",
         name="🌍 Супутник HD (Esri)",
     )
+    # Одразу вписуємо вид карти РІВНО в квадрат пошуку — інакше Leaflet
+    # підвантажує NDVI/супутникові тайли з набагато ширшої області, ніж
+    # реально потрібно, і це зайве навантаження на телефон і на Copernicus.
+    m.fit_bounds(bounds)
+    m.options["maxBounds"] = bounds
+    m.options["maxBoundsViscosity"] = 0.6  # м'яко "пружинить" назад, а не жорстко блокує
 
     folium.TileLayer(
         tiles="https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}",
@@ -1495,11 +1507,9 @@ def get_map(
     if show_harvest:
         harvest_overlay = build_harvest_overlay(round(lat, 5), round(lon, 5), round(radius_km, 2))
         if harvest_overlay is not None:
-            lat_delta = radius_km / 111.0
-            lon_delta = radius_km / (111.0 * math.cos(math.radians(lat)))
             ImageOverlay(
                 image=harvest_overlay,
-                bounds=[[lat - lat_delta, lon - lon_delta], [lat + lat_delta, lon + lon_delta]],
+                bounds=bounds,
                 opacity=1.0,
                 name="🌾 Скошені/зібрані ділянки (падіння NDVI від піку)",
             ).add_to(m)
