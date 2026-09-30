@@ -1,4 +1,5 @@
 import os
+import re
 import math
 import io
 import json
@@ -999,43 +1000,120 @@ def read_root():
     return {"status": "GeoPredict API (КР + WMS NDVI) працює"}
 
 
+@app.get("/api/places/search")
+def api_places_search(q: str = Query(..., min_length=2)):
+    """
+    Пошук населеного пункту за назвою через Nominatim (OpenStreetMap),
+    обмежений Сумською областю. Повертає список кандидатів з координатами —
+    щоб не вводити lat/lon вручну.
+    """
+    try:
+        resp = requests.get(
+            "https://nominatim.openstreetmap.org/search",
+            params={
+                "q": q,
+                "format": "json",
+                "countrycodes": "ua",
+                "viewbox": "32.4,52.2,35.8,49.9",  # Сумська область із запасом (lon1,lat1,lon2,lat2)
+                "bounded": 1,
+                "limit": 8,
+                "addressdetails": 1,
+            },
+            headers={"User-Agent": "GeoPredict/1.0 (archaeology research helper)"},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        results = []
+        for item in resp.json():
+            addr = item.get("address", {})
+            place_name = (
+                addr.get("village") or addr.get("town") or addr.get("city")
+                or addr.get("hamlet") or item.get("name") or item.get("display_name", "").split(",")[0]
+            )
+            results.append({
+                "name": place_name,
+                "display_name": item.get("display_name", ""),
+                "lat": round(float(item["lat"]), 5),
+                "lon": round(float(item["lon"]), 5),
+            })
+        return {"results": results}
+    except Exception as exc:
+        print(f"[places_search] Помилка: {exc}")
+        return JSONResponse({"detail": f"Пошук тимчасово недоступний: {exc}", "results": []}, status_code=200)
+
+
 @app.get("/test", response_class=HTMLResponse)
 def test_form():
     """
-    Проста сторінка з формою: вводите lat/lon/radius_km один раз,
-    а посилання на /map та /api/analyze збираються самі — не треба
-    вручну дописувати ?lat=...&lon=...&radius_km=... в адресний рядок.
+    Сторінка вибору місця: пошук населеного пункту замість ручного введення
+    координат, плюс радіус, культура і опційні шари — і одразу готові
+    посилання на /map та /api/analyze.
     """
     return """
     <!DOCTYPE html>
     <html lang="uk">
     <head>
         <meta charset="utf-8">
-        <title>GeoPredict — тест</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>GeoPredict — вибір місця</title>
         <style>
-            body { font-family: sans-serif; max-width: 480px; margin: 40px auto; padding: 0 16px; }
-            label { display: block; margin-top: 14px; font-weight: bold; }
-            input { width: 100%; padding: 8px; box-sizing: border-box; font-size: 16px; }
+            body { font-family: sans-serif; max-width: 480px; margin: 20px auto; padding: 0 16px; }
+            label { display: block; margin-top: 14px; font-weight: bold; font-size: 14px; }
+            input, select { width: 100%; padding: 10px; box-sizing: border-box; font-size: 16px; margin-top: 4px; }
+            .suggestions { margin-top: 6px; }
+            .suggestion-btn {
+                display: block; width: 100%; text-align: left; padding: 10px;
+                margin-top: 4px; border: 1px solid #8883; border-radius: 6px;
+                background: transparent; font-size: 15px; cursor: pointer;
+            }
+            .suggestion-btn:active { background: #8882; }
+            .picked { padding: 10px; border-radius: 6px; background: #2c7be522; margin-top: 8px; font-size: 14px; }
             .row { display: flex; gap: 10px; margin-top: 20px; }
+            .row2 { display: flex; gap: 10px; margin-top: 10px; }
+            .row2 > div { flex: 1; }
             a.btn {
                 flex: 1; text-align: center; padding: 12px; border-radius: 6px;
                 text-decoration: none; color: white; font-weight: bold;
             }
             .btn-map { background: #2c7be5; }
             .btn-json { background: #2f9e44; }
+            .muted { opacity: .65; font-size: 13px; margin-top: 4px; }
         </style>
     </head>
     <body>
-        <h2>GeoPredict — швидкий тест</h2>
+        <h2>📍 Оберіть місце пошуку</h2>
 
-        <label for="lat">Широта (lat)</label>
-        <input id="lat" type="number" step="0.00001" value="50.75">
+        <label for="place">Населений пункт (Сумська обл.)</label>
+        <input id="place" type="text" placeholder="напр. Ромни, Конотоп, Кролевець...">
+        <div class="suggestions" id="suggestions"></div>
+        <div class="picked" id="picked" style="display:none;"></div>
 
-        <label for="lon">Довгота (lon)</label>
-        <input id="lon" type="number" step="0.00001" value="33.47">
+        <div class="row2">
+            <div>
+                <label for="lat">Широта</label>
+                <input id="lat" type="number" step="0.00001" value="50.75">
+            </div>
+            <div>
+                <label for="lon">Довгота</label>
+                <input id="lon" type="number" step="0.00001" value="33.47">
+            </div>
+        </div>
+        <div class="muted">Можна й ввести вручну — поля вище завжди редаговані.</div>
 
-        <label for="radius">Радіус (км)</label>
-        <input id="radius" type="number" step="0.5" min="0.5" max="20" value="5">
+        <label for="radius">Радіус пошуку (км)</label>
+        <input id="radius" type="number" step="0.5" min="0.5" max="50" value="5">
+
+        <label for="culture">Культура</label>
+        <select id="culture">
+            <option value="cherniakhiv">Черняхівська</option>
+            <option value="kr">Київська Русь</option>
+            <option value="both">Обидві</option>
+        </select>
+
+        <div class="row2">
+            <div><label><input type="checkbox" id="ravines"> Яри/ложбини</label></div>
+            <div><label><input type="checkbox" id="harvest"> Скошені поля</label></div>
+        </div>
 
         <div class="row">
             <a class="btn btn-map" id="mapLink" href="#" target="_blank">Відкрити карту</a>
@@ -1043,19 +1121,61 @@ def test_form():
         </div>
 
         <script>
-            const latEl = document.getElementById('lat');
-            const lonEl = document.getElementById('lon');
-            const radEl = document.getElementById('radius');
-            const mapLink = document.getElementById('mapLink');
-            const jsonLink = document.getElementById('jsonLink');
+            const $ = id => document.getElementById(id);
+            let searchTimer = null;
 
-            function updateLinks() {
-                const q = `lat=${latEl.value}&lon=${lonEl.value}&radius_km=${radEl.value}`;
-                mapLink.href = `/map?${q}`;
-                jsonLink.href = `/api/analyze?${q}`;
+            $('place').addEventListener('input', () => {
+                clearTimeout(searchTimer);
+                const q = $('place').value.trim();
+                if (q.length < 2) { $('suggestions').innerHTML = ''; return; }
+                searchTimer = setTimeout(() => runSearch(q), 400);
+            });
+
+            async function runSearch(q) {
+                $('suggestions').innerHTML = '<div class="muted">Шукаю…</div>';
+                try {
+                    const r = await fetch('/api/places/search?q=' + encodeURIComponent(q + ', Сумська область'));
+                    const data = await r.json();
+                    const box = $('suggestions');
+                    box.innerHTML = '';
+                    if (!data.results || !data.results.length) {
+                        box.innerHTML = '<div class="muted">Нічого не знайдено. Спробуйте іншу назву або введіть координати вручну.</div>';
+                        return;
+                    }
+                    data.results.forEach(place => {
+                        const b = document.createElement('button');
+                        b.className = 'suggestion-btn';
+                        b.type = 'button';
+                        b.textContent = place.display_name;
+                        b.onclick = () => pick(place);
+                        box.appendChild(b);
+                    });
+                } catch (e) {
+                    $('suggestions').innerHTML = '<div class="muted">Помилка пошуку. Введіть координати вручну.</div>';
+                }
             }
 
-            [latEl, lonEl, radEl].forEach(el => el.addEventListener('input', updateLinks));
+            function pick(place) {
+                $('lat').value = place.lat;
+                $('lon').value = place.lon;
+                $('suggestions').innerHTML = '';
+                $('place').value = place.name;
+                const p = $('picked');
+                p.style.display = 'block';
+                p.textContent = '✅ Обрано: ' + place.display_name + ' (' + place.lat + ', ' + place.lon + ')';
+                updateLinks();
+            }
+
+            function updateLinks() {
+                const q = `lat=${$('lat').value}&lon=${$('lon').value}&radius_km=${$('radius').value}&culture=${$('culture').value}`
+                    + `&show_ravines=${$('ravines').checked}&show_harvest=${$('harvest').checked}`;
+                $('mapLink').href = `/map?${q}`;
+                $('jsonLink').href = `/api/analyze?lat=${$('lat').value}&lon=${$('lon').value}&radius_km=${$('radius').value}&culture=${$('culture').value}`;
+            }
+
+            ['lat','lon','radius','culture','ravines','harvest'].forEach(id =>
+                $(id).addEventListener('input', updateLinks)
+            );
             updateLinks();
         </script>
     </body>
@@ -1424,10 +1544,35 @@ def get_map(
 
     folium.LayerControl(collapsed=False).add_to(m)
     html = m.get_root().render()
+
     mobile_fix = (
         '<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">\n'
-        "<style>html,body{margin:0;padding:0;width:100%;height:100%;} "
-        ".folium-map{width:100% !important;height:100% !important;}</style>\n"
+        "<style>"
+        "html,body{margin:0;padding:0;width:100%;height:100%;} "
+        ".folium-map{width:100% !important;height:100% !important;} "
+        # Список шарів раніше вилазив за межі екрана на вузьких телефонах —
+        # обмежуємо ширину видимою областю й даємо горизонтальний скрол як запобіжник.
+        ".leaflet-control-layers-expanded{"
+        "max-width:82vw !important;max-height:70vh !important;overflow:auto !important;"
+        "font-size:13px !important;box-sizing:border-box !important;white-space:normal !important;}"
+        ".leaflet-top.leaflet-right{right:4px !important;left:auto !important;max-width:82vw;}"
+        "</style>\n"
     )
     html = html.replace("<head>", "<head>\n" + mobile_fix, 1)
+
+    # Маркери ложбин/яруг інколи не показувались одразу після завантаження —
+    # класична проблема Leaflet: контейнер карти обчислює розмір ДО того, як
+    # застосувався CSS на весь екран, і частина маркерів опиняється поза
+    # видимою (на той момент коротшою) областю. invalidateSize() після
+    # повного завантаження сторінки примушує Leaflet перерахувати розміри.
+    m_match = re.search(r"var (map_[0-9a-f]+) = L\.map", html)
+    if m_match:
+        map_var = m_match.group(1)
+        fix_script = (
+            f"<script>window.addEventListener('load', function() {{ "
+            f"setTimeout(function() {{ {map_var}.invalidateSize(); }}, 250); "
+            f"}});</script>\n"
+        )
+        html = html.replace("</body>", fix_script + "</body>", 1)
+
     return HTMLResponse(content=html)
