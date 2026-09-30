@@ -34,7 +34,36 @@ MAX_RADIUS_KM = 50.0
 MIN_RADIUS_KM = 0.5
 TARGET_CELL_M = 35.0   # цільовий розмір клітинки сітки (SRTM ~30м/піксель)
 MIN_GRID_STEPS = 40
-MAX_GRID_STEPS = 160    # жорсткий стеля, щоб запит завжди встигав у таймаут Render
+# Було 160 -> при радіусі 10 км клітинка ~125 м, мисів/терас просто не видно.
+# Тепер розрахунок іде у фоновому потоці з прогрес-баром (/loading), тож стелю можна підняти.
+MAX_GRID_STEPS = int(os.environ.get("MAX_GRID_STEPS", "300"))
+
+# --- Параметри "скільки точок показувати" (можна міняти через змінні середовища Render) ---
+MIN_SCORE = float(os.environ.get("MIN_SCORE", "36"))             # було 42
+MAX_POINTS_BIG = int(os.environ.get("MAX_POINTS_BIG", "80"))     # радіус >= 10 км, було 35
+MAX_POINTS_SMALL = int(os.environ.get("MAX_POINTS_SMALL", "50")) # радіус < 10 км, було 20
+NMS_KR_M = float(os.environ.get("NMS_KR_M", "90"))               # було 130
+NMS_CHERN_M = float(os.environ.get("NMS_CHERN_M", "70"))         # було 100
+KR_DROP_MIN = float(os.environ.get("KR_DROP_MIN", "3.0"))        # було 3.5 м
+KR_MAX_DROP_MIN = float(os.environ.get("KR_MAX_DROP_MIN", "3.5"))  # було 4.0 м
+KR_DELTA_H_MIN = float(os.environ.get("KR_DELTA_H_MIN", "5.0"))  # було 6.0 м
+
+# --- Прогрес довгих розрахунків ---
+_tl = threading.local()
+_PHASES = {
+    "grid":    (0.00, 0.45, "Висоти SRTM"),
+    "ravines": (0.45, 0.55, "Яри та джерела"),
+    "hollows": (0.55, 0.65, "Ложбини"),
+    "scan":    (0.65, 0.93, "Пошук точок"),
+    "harvest": (0.93, 1.00, "Супутникові знімки NDVI"),
+}
+
+
+def _report(phase: str, frac: float = 0.0, detail: str = ""):
+    """Повідомляє прогрес, якщо поточний потік запущено як фонове завдання."""
+    cb = getattr(_tl, "cb", None)
+    if cb is not None:
+        cb(phase, frac, detail)
 
 # --------------------------------------------------------------------------
 # Прекомп'ютовані яри/джерела (щоб не рахувати наживо щоразу)
@@ -116,6 +145,9 @@ def sentinel_time_range(days: int = CLOUD_SEARCH_WINDOW_DAYS) -> str:
     return f"{start.isoformat()}/{end.isoformat()}"
 
 
+_NDVI_LAYER_MISSING = {"flag": False}
+
+
 def _fetch_ndvi_snapshot(sh_url: str, bbox, width: int, height: int, days_from: int, days_to: int):
     """
     Один WMS GetMap запит до шару NDVI_RAW за вікно [days_to; days_from] днів тому.
@@ -146,6 +178,8 @@ def _fetch_ndvi_snapshot(sh_url: str, bbox, width: int, height: int, days_from: 
         if resp.status_code != 200:
             # Показуємо тіло відповіді — Sentinel Hub зазвичай пише точну причину помилки в XML.
             print(f"[harvest_overlay] HTTP {resp.status_code} від Copernicus: {resp.text[:500]}")
+            if "LayerNotDefined" in resp.text:
+                _NDVI_LAYER_MISSING["flag"] = True
             resp.raise_for_status()
         img = Image.open(io.BytesIO(resp.content)).convert("LA")
         arr = np.array(img)
@@ -181,10 +215,21 @@ def build_harvest_overlay(lat: float, lon: float, radius_km: float):
     side_m = 2 * radius_km * 1000.0
     px = max(200, min(HARVEST_OVERLAY_MAX_PX, int(side_m / 25)))
 
-    snapshots = [
-        _fetch_ndvi_snapshot(sh_url, bbox, px, px, days_from, days_to)
-        for days_from, days_to in HARVEST_SNAPSHOT_WINDOWS_DAYS
-    ]
+    windows = HARVEST_SNAPSHOT_WINDOWS_DAYS
+    _report("harvest", 0.0, f"Знімок 1 з {len(windows)} (поточний стан)")
+    first = _fetch_ndvi_snapshot(sh_url, bbox, px, px, *windows[0])
+    if _NDVI_LAYER_MISSING["flag"]:
+        print(f"[harvest_overlay] Шар '{COPERNICUS_NDVI_RAW_LAYER}' не створено в Sentinel Hub "
+              f"Configuration Utility — решту запитів пропускаю.")
+        return None
+
+    from concurrent.futures import ThreadPoolExecutor
+    rest = windows[1:]
+    _report("harvest", 0.3, f"Історичні знімки ({len(rest)} шт.) — паралельно")
+    with ThreadPoolExecutor(max_workers=len(rest)) as pool:
+        futures = [pool.submit(_fetch_ndvi_snapshot, sh_url, bbox, px, px, df, dt) for df, dt in rest]
+        others = [f.result() for f in futures]
+    snapshots = [first] + others
 
     current = snapshots[0]
     history = [s for s in snapshots[1:] if s is not None]
@@ -280,12 +325,12 @@ def detect_promontory_kr(grid: np.ndarray, r: int, c: int) -> float:
             nr, nc = r + dr * step, c + dc * step
             if 0 <= nr < rows and 0 <= nc < cols:
                 drop = z - float(grid[nr, nc])
-                if drop >= 3.5:
+                if drop >= KR_DROP_MIN:
                     lower_count += 1
                     max_drop = max(max_drop, drop)
                     break
 
-    if lower_count >= 3 and max_drop >= 4.0:
+    if lower_count >= 3 and max_drop >= KR_MAX_DROP_MIN:
         return min(1.0, (lower_count / 8.0) * 0.5 + (max_drop / 15.0) * 0.5)
     return 0.0
 
@@ -321,7 +366,7 @@ def analyze_site_kr(grid: np.ndarray, r: int, c: int, lat_v: float, lon_v: float
     min_z, dist_to_water_m = nearest_lower_point(grid, r, c, search_r, cell_size_m)
 
     delta_h = z_center - min_z
-    if delta_h < 6.0:
+    if delta_h < KR_DELTA_H_MIN:
         return None
 
     if 10.0 <= delta_h <= 30.0:
@@ -471,19 +516,33 @@ def analyze_site_chernyakhiv(grid: np.ndarray, r: int, c: int, lat_v: float, lon
 
 
 def strict_nms_clustering(results: list, min_dist_m: float) -> list:
+    """Non-max suppression: лишає найкращі точки, викидає сусідні ближче за min_dist_m.
+    Просторові кошики замість повного перебору — на десятках тисяч кандидатів це секунди замість хвилин."""
     results.sort(key=lambda x: x["score"], reverse=True)
+    if not results:
+        return []
+    kx = 111000.0 * math.cos(math.radians(results[0]["lat"]))
+    ky = 111000.0
+    min2 = min_dist_m * min_dist_m
+    buckets = {}
     filtered = []
     for pt in results:
+        x, y = pt["lon"] * kx, pt["lat"] * ky
+        bx, by = int(x // min_dist_m), int(y // min_dist_m)
         keep = True
-        for existing in filtered:
-            d_lat = (pt["lat"] - existing["lat"]) * 111000
-            d_lon = (pt["lon"] - existing["lon"]) * 111000 * math.cos(math.radians(pt["lat"]))
-            dist = math.sqrt(d_lat ** 2 + d_lon ** 2)
-            if dist < min_dist_m:
-                keep = False
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for ex, ey in buckets.get((bx + dx, by + dy), ()):
+                    if (x - ex) ** 2 + (y - ey) ** 2 < min2:
+                        keep = False
+                        break
+                if not keep:
+                    break
+            if not keep:
                 break
         if keep:
             filtered.append(pt)
+            buckets.setdefault((bx, by), []).append((x, y))
     return filtered
 
 
@@ -499,10 +558,12 @@ def build_grid(lat: float, lon: float, radius_km: float, grid_steps: int):
     cell_size_m = (2 * radius_km * 1000.0) / grid_steps
 
     grid = np.zeros((len(lats), len(lons)), dtype=np.float32)
+    n_rows = len(lats)
     for i, la in enumerate(lats):
         for j, lo in enumerate(lons):
             alt = src.get_elevation(float(la), float(lo))
             grid[i, j] = alt if alt is not None else 0.0
+        _report("grid", (i + 1) / n_rows, f"Рядок сітки {i + 1} з {n_rows}")
 
     return grid, lats, lons, cell_size_m
 
@@ -591,6 +652,7 @@ def detect_channel_heads(grid: np.ndarray, acc: np.ndarray, flow_to: np.ndarray,
 
 
 @lru_cache(maxsize=32)
+@lru_cache(maxsize=8)
 def get_channel_heads_and_masks(lat: float, lon: float, radius_km: float):
     """
     ЖИВЕ обчислення (без прекомп'ютованого кешу) яруг/джерел для заданого
@@ -610,6 +672,16 @@ def build_distance_grid(grid: np.ndarray, target_indices: tuple, cell_size_m: fl
     dist_grid = np.full((rows, cols), np.inf, dtype=np.float64)
     if not target_indices:
         return dist_grid
+
+    # Швидкий шлях: одна EDT-операція замість циклу "голова яру x вся сітка".
+    try:
+        from scipy.ndimage import distance_transform_edt
+        mask = np.ones((rows, cols), dtype=bool)
+        for tr, tc in target_indices:
+            mask[tr, tc] = False
+        return distance_transform_edt(mask) * cell_size_m
+    except ImportError:
+        pass  # scipy нема в requirements.txt — працює повільніший запасний цикл нижче
 
     rr, cc = np.indices((rows, cols))
     for tr, tc in target_indices:
@@ -971,25 +1043,27 @@ def run_analysis(lat: float, lon: float, radius_km: float, culture: str = "kr") 
     raw_kr, raw_chern = [], []
 
     for r in range(3, rows - 3):
+        _report("scan", (r - 3) / max(1, rows - 6),
+                f"Рядок {r - 2} з {rows - 6}, кандидатів: {len(raw_kr) + len(raw_chern)}")
         for c in range(3, cols - 3):
             lat_v = round(float(lats[r]), 5)
             lon_v = round(float(lons[c]), 5)
 
             if culture in ("kr", "both"):
                 res = analyze_site_kr(grid, r, c, lat_v, lon_v, cell_size_m)
-                if res and res["score"] >= 42.0:
+                if res and res["score"] >= MIN_SCORE:
                     raw_kr.append(res)
 
             if culture in ("cherniakhiv", "both"):
                 dist_spring = float(spring_dist_grid[r, c]) if spring_dist_grid is not None else None
                 dist_hollow = float(hollow_dist_grid[r, c]) if hollow_dist_grid is not None else None
                 res_c = analyze_site_chernyakhiv(grid, r, c, lat_v, lon_v, cell_size_m, dist_spring, dist_hollow)
-                if res_c and res_c["score"] >= 42.0:
+                if res_c and res_c["score"] >= MIN_SCORE:
                     raw_chern.append(res_c)
 
-    limit = 35 if radius_km >= 10 else 20
-    clean_kr = strict_nms_clustering(raw_kr, min_dist_m=130.0)[:limit]
-    clean_chern = strict_nms_clustering(raw_chern, min_dist_m=100.0)[:limit]
+    limit = MAX_POINTS_BIG if radius_km >= 10 else MAX_POINTS_SMALL
+    clean_kr = strict_nms_clustering(raw_kr, min_dist_m=NMS_KR_M)[:limit]
+    clean_chern = strict_nms_clustering(raw_chern, min_dist_m=NMS_CHERN_M)[:limit]
 
     return tuple(clean_kr + clean_chern)
 
@@ -998,51 +1072,318 @@ def run_analysis(lat: float, lon: float, radius_km: float, culture: str = "kr") 
 # Ендпоінти
 # --------------------------------------------------------------------------
 
+# --------------------------------------------------------------------------
+# Фонові розрахунки з прогрес-баром
+# --------------------------------------------------------------------------
+# /loading?<ті самі параметри, що й /map> — сторінка з прогрес-баром: запускає
+# розрахунок у фоні (/api/job/start), опитує /api/job/status і, коли все готове
+# (результати вже в lru_cache), перекидає на /map, яка відкривається миттєво.
+# Solar2D може робити те саме: start -> опитувати status -> /api/analyze.
+
+_jobs = {}
+_jobs_lock = threading.Lock()
+_job_sem = threading.Semaphore(1)  # одна важка задача за раз — на Render мало CPU/RAM
+
+
+def _run_job(job_id, lat, lon, radius_km, culture, show_ravines, show_hollows, show_harvest):
+    job = _jobs[job_id]
+
+    def cb(phase, frac, detail):
+        a, b, label = _PHASES[phase]
+        job["percent"] = round((a + (b - a) * max(0.0, min(1.0, frac))) * 100, 1)
+        job["stage"] = label
+        job["detail"] = detail
+        job["updated"] = time.time()
+
+    job["stage"], job["detail"] = "У черзі", "Чекаю, поки завершиться попередній розрахунок"
+    job["updated"] = time.time()
+    with _job_sem:
+        _tl.cb = cb
+        try:
+            cb("grid", 0.0, "Завантаження SRTM-тайлів (при першому запуску — довше)")
+            grid, lats, lons, _cell = get_grid_bundle(lat, lon, radius_km)
+
+            chern = culture in ("cherniakhiv", "both")
+            if chern or show_ravines or show_hollows:
+                cb("ravines", 0.0, "Аналіз стоку води…")
+                get_channel_head_indices_for_scoring(lat, lon, radius_km, grid, lats, lons)
+                if show_ravines:
+                    get_ravines_for_area(lat, lon, radius_km)
+                cb("ravines", 1.0, "")
+            if chern or show_hollows:
+                cb("hollows", 0.0, "Пошук ложбин біля джерел…")
+                get_hollows_for_area(lat, lon, radius_km)
+                cb("hollows", 1.0, "")
+
+            cb("scan", 0.0, "Сканування рельєфу")
+            results = run_analysis(lat, lon, radius_km, culture)
+            job["count"] = len(results)
+
+            if show_harvest:
+                cb("harvest", 0.0, "Запит до Copernicus…")
+                build_harvest_overlay(lat, lon, radius_km)
+                cb("harvest", 1.0, "")
+
+            job.update(status="done", percent=100.0, stage="Готово", detail=f"Знайдено точок: {len(results)}")
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            job.update(status="error", error=f"{type(exc).__name__}: {exc}")
+        finally:
+            _tl.cb = None
+            job["updated"] = time.time()
+
+
+@app.get("/api/job/start")
+def api_job_start(
+    lat: float = Query(50.75, ge=-85, le=85),
+    lon: float = Query(33.47, ge=-180, le=180),
+    radius_km: float = Query(10.0, ge=MIN_RADIUS_KM, le=MAX_RADIUS_KM),
+    culture: str = Query("kr", pattern="^(kr|cherniakhiv|both)$"),
+    show_ravines: bool = Query(False),
+    show_hollows: bool = Query(False),
+    show_harvest: bool = Query(False),
+):
+    lat, lon, radius_km = round(lat, 5), round(lon, 5), round(radius_km, 2)
+    key = (lat, lon, radius_km, culture, show_ravines, show_hollows, show_harvest)
+    now = time.time()
+    with _jobs_lock:
+        for jid in [j for j, v in _jobs.items() if now - v["updated"] > 3600]:
+            del _jobs[jid]
+        for jid, v in _jobs.items():
+            if v["key"] == key and (v["status"] == "running" or (v["status"] == "done" and now - v["updated"] < 600)):
+                return {"job_id": jid}
+        job_id = uuid.uuid4().hex[:12]
+        _jobs[job_id] = {"key": key, "status": "running", "percent": 0.0, "stage": "Запуск", "detail": "",
+                         "t0": now, "updated": now, "count": None, "error": None}
+    threading.Thread(target=_run_job, daemon=True,
+                     args=(job_id, lat, lon, radius_km, culture, show_ravines, show_hollows, show_harvest)).start()
+    return {"job_id": job_id}
+
+
+@app.get("/api/job/status")
+def api_job_status(id: str = Query(...)):
+    job = _jobs.get(id)
+    if job is None:
+        return {"status": "unknown"}  # напр. сервер перезапустився — клієнт має стартувати заново
+    now = time.time()
+    return {"status": job["status"], "percent": job["percent"], "stage": job["stage"],
+            "detail": job["detail"], "elapsed_s": round(now - job["t0"], 1),
+            "idle_s": round(now - job["updated"], 1), "count": job["count"], "error": job["error"]}
+
+
+@app.get("/loading", response_class=HTMLResponse)
+def loading_page():
+    return """
+    <!DOCTYPE html>
+    <html lang="uk"><head><meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>GeoPredict — розрахунок</title>
+    <style>
+        body { font-family: sans-serif; max-width: 480px; margin: 40px auto; padding: 0 16px; }
+        .bar { height: 22px; border-radius: 11px; background: #8883; overflow: hidden; }
+        .fill { height: 100%; width: 0; background: #2c7be5; transition: width .5s; }
+        .pct { font-size: 32px; font-weight: bold; margin-top: 10px; }
+        .muted { opacity: .7; font-size: 13px; margin-top: 6px; }
+        .warn { color: #d9534f; opacity: 1; }
+        .err { color: #d9534f; font-weight: bold; margin-top: 12px; }
+    </style></head>
+    <body>
+        <h3>⏳ Аналіз рельєфу…</h3>
+        <div class="bar"><div class="fill" id="fill"></div></div>
+        <div class="pct" id="pct">0%</div>
+        <div id="stage">Запуск…</div>
+        <div class="muted" id="detail"></div>
+        <div class="muted" id="timer"></div>
+        <div class="muted warn" id="warn"></div>
+        <div class="err" id="err"></div>
+        <div class="muted">Перший запуск після простою може тривати до хвилини: Render «прокидає» сервер і качає дані SRTM.</div>
+    <script>
+        const $ = id => document.getElementById(id);
+        const qs = location.search;
+        const t0 = Date.now();
+        let jobId = null, fails = 0;
+        setInterval(() => { $('timer').textContent = 'Минуло: ' + Math.floor((Date.now() - t0) / 1000) + ' с'; }, 500);
+
+        async function start() {
+            try {
+                const r = await fetch('/api/job/start' + qs);
+                if (!r.ok) throw new Error('HTTP ' + r.status);
+                jobId = (await r.json()).job_id;
+                fails = 0; $('warn').textContent = '';
+                poll();
+            } catch (e) {
+                fails++;
+                $('warn').textContent = 'Сервер не відповідає (ймовірно, прокидається). Спроба ' + fails + '…';
+                setTimeout(start, 3000);
+            }
+        }
+
+        async function poll() {
+            try {
+                const r = await fetch('/api/job/status?id=' + jobId);
+                const d = await r.json();
+                if (d.status === 'unknown') { $('warn').textContent = 'Сервер перезапустився — стартую заново…'; return start(); }
+                fails = 0;
+                const p = Math.round(d.percent || 0);
+                $('fill').style.width = p + '%';
+                $('pct').textContent = p + '%';
+                $('stage').textContent = d.stage || '';
+                $('detail').textContent = d.detail || '';
+                $('warn').textContent = d.idle_s > 20 ? 'Немає оновлень ' + Math.round(d.idle_s) + ' с — триває важкий крок (напр. завантаження SRTM), процес живий.' : '';
+                if (d.status === 'error') { $('err').textContent = 'Помилка: ' + d.error; return; }
+                if (d.status === 'done') { $('stage').textContent = 'Готово, відкриваю карту…'; location.replace('/map' + qs); return; }
+                setTimeout(poll, 1000);
+            } catch (e) {
+                fails++;
+                $('warn').textContent = 'Немає зв\u2019язку з сервером, спроба ' + fails + '…';
+                setTimeout(poll, 3000);
+            }
+        }
+        start();
+    </script></body></html>
+    """
+
+
 @app.get("/")
 def read_root():
     return {"status": "GeoPredict API (КР + WMS NDVI) працює"}
 
 
+_PLACE_RANK = {"city": 0, "town": 1, "village": 2, "hamlet": 3, "suburb": 4,
+               "neighbourhood": 5, "isolated_dwelling": 6, "locality": 7}
+_PLACE_UK = {"city": "місто", "town": "місто", "village": "село", "hamlet": "хутір",
+             "suburb": "район", "neighbourhood": "мікрорайон",
+             "isolated_dwelling": "двір/хутір", "locality": "урочище"}
+SUMY_VIEWBOX = "32.4,52.2,35.8,49.9"          # Nominatim: lon1,lat1,lon2,lat2
+SUMY_BBOX_OVERPASS = "49.9,32.4,52.2,35.8"    # Overpass: south,west,north,east
+_OVERPASS_URLS = ["https://overpass-api.de/api/interpreter",
+                  "https://overpass.kumi.systems/api/interpreter"]
+_PLACES_CACHE = {}
+
+
+def _clean_place_query(q: str) -> str:
+    # Раніше фронтенд додавав ", Сумська область" до запиту — через це Nominatim
+    # майже не знаходив села. Прибираємо цей хвіст, рамки Сумщини задає viewbox.
+    q = q.strip()
+    q = re.sub(r"[,\s]*(сумська\s+обл(?:асть|\.)?|сумщина)\s*$", "", q, flags=re.IGNORECASE)
+    return q.strip(" ,")
+
+
+def _nominatim_places(q: str) -> list:
+    resp = requests.get(
+        "https://nominatim.openstreetmap.org/search",
+        params={"q": q, "format": "jsonv2", "countrycodes": "ua",
+                "viewbox": SUMY_VIEWBOX, "bounded": 1, "limit": 20,
+                "addressdetails": 1, "accept-language": "uk", "dedupe": 1},
+        headers={"User-Agent": "GeoPredict/1.0 (archaeology research helper)"},
+        timeout=12,
+    )
+    resp.raise_for_status()
+    out = []
+    for item in resp.json():
+        kind = next((k for k in (item.get("addresstype"), item.get("type")) if k in _PLACE_RANK), None)
+        if kind is None:
+            continue  # вулиці, магазини тощо — не населені пункти
+        disp = item.get("display_name", "")
+        name = item.get("name") or disp.split(",")[0]
+        out.append({"name": name, "kind": kind, "display_name": disp,
+                    "label": f"{_PLACE_UK.get(kind, kind)}: {disp}",
+                    "lat": round(float(item["lat"]), 5), "lon": round(float(item["lon"]), 5)})
+    return out
+
+
+def _ci_regex(text: str) -> str:
+    """Регістронезалежний regex через класи [Гг] — надійніше за ',i' для кирилиці в Overpass."""
+    parts = []
+    for ch in text:
+        if ch.upper() != ch.lower():
+            parts.append(f"[{ch.upper()}{ch.lower()}]")
+        else:
+            parts.append(re.escape(ch))
+    return "".join(parts)
+
+
+def _overpass_places(q: str) -> list:
+    safe = re.sub(r"[^0-9A-Za-zА-Яа-яІіЇїЄєҐґʼ'’\- ]", "", q)
+    if len(safe) < 2:
+        return []
+    query = (
+        '[out:json][timeout:20];'
+        'nwr["place"~"^(city|town|village|hamlet|suburb|isolated_dwelling|locality)$"]'
+        f'["name"~"{_ci_regex(safe)}"]({SUMY_BBOX_OVERPASS});out center 40;'
+    )
+    elements = None
+    for url in _OVERPASS_URLS:
+        try:
+            r = requests.post(url, data={"data": query}, timeout=25,
+                              headers={"User-Agent": "GeoPredict/1.0"})
+            r.raise_for_status()
+            elements = r.json().get("elements", [])
+            break
+        except Exception as exc:
+            print(f"[places_search] Overpass {url}: {exc}")
+    out = []
+    for el in elements or []:
+        tags = el.get("tags", {})
+        kind = tags.get("place")
+        lat = el.get("lat") or (el.get("center") or {}).get("lat")
+        lon = el.get("lon") or (el.get("center") or {}).get("lon")
+        if not kind or lat is None or lon is None or not tags.get("name"):
+            continue
+        name = tags["name"]
+        out.append({"name": name, "kind": kind, "display_name": f"{name} ({lat:.4f}, {lon:.4f})",
+                    "label": f"{_PLACE_UK.get(kind, kind)}: {name} ({lat:.3f}, {lon:.3f})",
+                    "lat": round(float(lat), 5), "lon": round(float(lon), 5)})
+    return out
+
+
 @app.get("/api/places/search")
 def api_places_search(q: str = Query(..., min_length=2)):
     """
-    Пошук населеного пункту за назвою через Nominatim (OpenStreetMap),
-    обмежений Сумською областю. Повертає список кандидатів з координатами —
-    щоб не вводити lat/lon вручну.
+    Пошук населеного пункту (місто, село, хутір, урочище) у межах Сумщини:
+    Nominatim + доповнення з Overpass (частковий збіг назви, дрібні села).
     """
+    q_clean = _clean_place_query(q)
+    if len(q_clean) < 2:
+        return {"results": []}
+    if q_clean.lower() in _PLACES_CACHE:
+        return {"results": _PLACES_CACHE[q_clean.lower()]}
+
+    found, errors = [], []
     try:
-        resp = requests.get(
-            "https://nominatim.openstreetmap.org/search",
-            params={
-                "q": q,
-                "format": "json",
-                "countrycodes": "ua",
-                "viewbox": "32.4,52.2,35.8,49.9",  # Сумська область із запасом (lon1,lat1,lon2,lat2)
-                "bounded": 1,
-                "limit": 8,
-                "addressdetails": 1,
-            },
-            headers={"User-Agent": "GeoPredict/1.0 (archaeology research helper)"},
-            timeout=15,
-        )
-        resp.raise_for_status()
-        results = []
-        for item in resp.json():
-            addr = item.get("address", {})
-            place_name = (
-                addr.get("village") or addr.get("town") or addr.get("city")
-                or addr.get("hamlet") or item.get("name") or item.get("display_name", "").split(",")[0]
-            )
-            results.append({
-                "name": place_name,
-                "display_name": item.get("display_name", ""),
-                "lat": round(float(item["lat"]), 5),
-                "lon": round(float(item["lon"]), 5),
-            })
-        return {"results": results}
+        found += _nominatim_places(q_clean)
     except Exception as exc:
-        print(f"[places_search] Помилка: {exc}")
-        return JSONResponse({"detail": f"Пошук тимчасово недоступний: {exc}", "results": []}, status_code=200)
+        errors.append(f"Nominatim: {exc}")
+        print(f"[places_search] Nominatim: {exc}")
+
+    if len(found) < 6:  # мало результатів — добираємо з Overpass
+        try:
+            found += _overpass_places(q_clean)
+        except Exception as exc:
+            errors.append(f"Overpass: {exc}")
+            print(f"[places_search] Overpass: {exc}")
+
+    seen, results = set(), []
+    ql = q_clean.lower()
+    found.sort(key=lambda p: (not p["name"].lower().startswith(ql), _PLACE_RANK.get(p["kind"], 9), p["name"]))
+    for p in found:
+        key = (p["name"].lower(), round(p["lat"], 2), round(p["lon"], 2))
+        if key in seen:
+            continue
+        seen.add(key)
+        results.append({k: p[k] for k in ("name", "display_name", "label", "lat", "lon")})
+        if len(results) >= 25:
+            break
+
+    if results:
+        if len(_PLACES_CACHE) > 300:
+            _PLACES_CACHE.clear()
+        _PLACES_CACHE[ql] = results
+    payload = {"results": results}
+    if errors and not results:
+        payload["detail"] = "Пошук тимчасово недоступний: " + "; ".join(errors)
+    return payload
 
 
 @app.get("/test", response_class=HTMLResponse)
@@ -1086,8 +1427,8 @@ def test_form():
     <body>
         <h2>📍 Оберіть місце пошуку</h2>
 
-        <label for="place">Населений пункт (Сумська обл.)</label>
-        <input id="place" type="text" placeholder="напр. Ромни, Конотоп, Кролевець...">
+        <label for="place">Населений пункт (місто, село, хутір — Сумщина)</label>
+        <input id="place" type="text" placeholder="напр. Ромни, Кролевець, будь-яке село...">
         <div class="suggestions" id="suggestions"></div>
         <div class="picked" id="picked" style="display:none;"></div>
 
@@ -1140,7 +1481,7 @@ def test_form():
             async function runSearch(q) {
                 $('suggestions').innerHTML = '<div class="muted">Шукаю…</div>';
                 try {
-                    const r = await fetch('/api/places/search?q=' + encodeURIComponent(q + ', Сумська область'));
+                    const r = await fetch('/api/places/search?q=' + encodeURIComponent(q));
                     const data = await r.json();
                     const box = $('suggestions');
                     box.innerHTML = '';
@@ -1152,7 +1493,7 @@ def test_form():
                         const b = document.createElement('button');
                         b.className = 'suggestion-btn';
                         b.type = 'button';
-                        b.textContent = place.display_name;
+                        b.textContent = place.label || place.display_name;
                         b.onclick = () => pick(place);
                         box.appendChild(b);
                     });
@@ -1175,7 +1516,7 @@ def test_form():
             function updateLinks() {
                 const q = `lat=${$('lat').value}&lon=${$('lon').value}&radius_km=${$('radius').value}&culture=${$('culture').value}`
                     + `&show_ravines=${$('ravines').checked}&show_hollows=${$('hollows').checked}&show_harvest=${$('harvest').checked}`;
-                $('mapLink').href = `/map?${q}`;
+                $('mapLink').href = `/loading?${q}`;
                 $('jsonLink').href = `/api/analyze?lat=${$('lat').value}&lon=${$('lon').value}&radius_km=${$('radius').value}&culture=${$('culture').value}`;
             }
 
