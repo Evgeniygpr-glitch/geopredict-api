@@ -1483,8 +1483,25 @@ def _info_overpass(lat, lon) -> list:
     return out[:8]
 
 
+def _find_llm_key() -> str:
+    """Ключ шукаємо за кількома назвами змінних (регістр у Render має значення) і за префіксом gsk_ (Groq)."""
+    for name in ("LLM_API_KEY", "GROQ_API_KEY"):
+        v = os.environ.get(name, "").strip()
+        if v:
+            return v
+    for name, val in os.environ.items():
+        v = val.strip()
+        if "GROQ" in name.upper() and v:
+            return v
+    for val in os.environ.values():
+        v = val.strip()
+        if v.startswith("gsk_") and len(v) > 30:
+            return v
+    return ""
+
+
 def _llm_chat(system: str, user: str) -> str:
-    key = os.environ.get("LLM_API_KEY") or os.environ.get("GROQ_API_KEY")
+    key = _find_llm_key()
     if not key:
         raise RuntimeError("no_key")
     base = os.environ.get("LLM_BASE_URL", "https://api.groq.com/openai/v1").rstrip("/")
@@ -1583,7 +1600,7 @@ def api_point_info(
         summary = _llm_chat(_INFO_SYSTEM, "ФАКТИ:\n" + "\n".join(facts) + "\n\nСкладіть довідку.")
     except Exception as exc:
         msg = str(exc)
-        llm_error = ("Не задано ключ LLM_API_KEY на Render" if msg == "no_key" else
+        llm_error = ("На Render не знайдено ключ Groq (змінна GROQ_API_KEY)" if msg == "no_key" else
                      "Ліміт запитів до AI вичерпано, спробуйте за хвилину" if msg == "rate_limit" else
                      f"Помилка AI: {msg}")
         print(f"[point_info] LLM: {msg}")
@@ -2118,7 +2135,7 @@ def get_map(
             ).add_to(hollow_fg)
         hollow_fg.add_to(m)
 
-    folium.LayerControl(collapsed=False).add_to(m)
+    folium.LayerControl(collapsed=True).add_to(m)
     html = m.get_root().render()
 
     mobile_fix = (
