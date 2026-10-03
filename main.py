@@ -1412,6 +1412,192 @@ def api_places_search(q: str = Query(..., min_length=2)):
     return payload
 
 
+# --------------------------------------------------------------------------
+# Історична довідка по точці (факти з Вікіпедії/OSM + стислий виклад через LLM)
+# --------------------------------------------------------------------------
+# Змінні середовища на Render:
+#   LLM_API_KEY  (або GROQ_API_KEY) — ключ
+#   LLM_BASE_URL — за замовчуванням Groq: https://api.groq.com/openai/v1
+#   LLM_MODEL    — за замовчуванням openai/gpt-oss-120b (якщо Groq змінить назву — поміняйте тут)
+# Модель отримує ЛИШЕ зібрані факти й не має права вигадувати знахідки та дати.
+
+_INFO_CACHE = {}
+_WIKI_API = "https://uk.wikipedia.org/w/api.php"
+_WIKI_HEADERS = {"User-Agent": "GeoPredict/1.0 (archaeology research helper)"}
+
+
+def _hav_m(lat1, lon1, lat2, lon2) -> float:
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dphi, dl = p2 - p1, math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * 6371000 * math.asin(math.sqrt(a))
+
+
+def _info_reverse(lat, lon) -> dict:
+    r = requests.get("https://nominatim.openstreetmap.org/reverse",
+                     params={"lat": lat, "lon": lon, "zoom": 14, "format": "jsonv2",
+                             "accept-language": "uk", "addressdetails": 1},
+                     headers=_WIKI_HEADERS, timeout=(3, 8))
+    r.raise_for_status()
+    a = r.json().get("address", {})
+    place = a.get("village") or a.get("hamlet") or a.get("town") or a.get("city") or a.get("suburb")
+    return {"place": place, "district": a.get("county") or a.get("municipality"), "state": a.get("state")}
+
+
+def _info_wiki_geo(lat, lon) -> list:
+    r = requests.get(_WIKI_API, params={"action": "query", "list": "geosearch", "gscoord": f"{lat}|{lon}",
+                                        "gsradius": 8000, "gslimit": 12, "format": "json"},
+                     headers=_WIKI_HEADERS, timeout=(3, 8))
+    r.raise_for_status()
+    return r.json().get("query", {}).get("geosearch", [])
+
+
+def _info_wiki_text(pageid: int) -> str:
+    """Розділ «Історія» зі статті (або початок статті)."""
+    r = requests.get(_WIKI_API, params={"action": "query", "prop": "extracts", "explaintext": 1,
+                                        "pageids": pageid, "format": "json"},
+                     headers=_WIKI_HEADERS, timeout=(3, 10))
+    r.raise_for_status()
+    page = next(iter(r.json().get("query", {}).get("pages", {}).values()), {})
+    text = page.get("extract", "") or ""
+    m = re.search(r"==\s*(Історія|Історичні відомості|Історичний нарис)[^=]*==\s*(.*?)(?:\n==[^=]|\Z)", text, re.S)
+    if m and len(m.group(2).strip()) > 80:
+        return m.group(2).strip()[:1800]
+    return text.split("\n==")[0].strip()[:900]
+
+
+def _info_overpass(lat, lon) -> list:
+    q = (f'[out:json][timeout:6];nwr(around:2500,{lat},{lon})["historic"];out center 15;')
+    r = requests.post(_OVERPASS_URLS[1], data={"data": q}, timeout=(3, 8), headers={"User-Agent": "GeoPredict/1.0"})
+    r.raise_for_status()
+    out = []
+    for el in r.json().get("elements", []):
+        t = el.get("tags", {})
+        la = el.get("lat") or (el.get("center") or {}).get("lat")
+        lo = el.get("lon") or (el.get("center") or {}).get("lon")
+        if la is None or lo is None:
+            continue
+        out.append({"name": t.get("name", ""), "kind": t.get("historic", ""),
+                    "dist_m": int(_hav_m(lat, lon, la, lo))})
+    out.sort(key=lambda x: x["dist_m"])
+    return out[:8]
+
+
+def _llm_chat(system: str, user: str) -> str:
+    key = os.environ.get("LLM_API_KEY") or os.environ.get("GROQ_API_KEY")
+    if not key:
+        raise RuntimeError("no_key")
+    base = os.environ.get("LLM_BASE_URL", "https://api.groq.com/openai/v1").rstrip("/")
+    model = os.environ.get("LLM_MODEL", "openai/gpt-oss-120b")
+    body = {"model": model, "temperature": 0.2, "max_tokens": 1500,
+            "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}
+    if "gpt-oss" in model:
+        body["reasoning_effort"] = "low"
+    r = requests.post(f"{base}/chat/completions", headers={"Authorization": f"Bearer {key}"},
+                      json=body, timeout=(5, 45))
+    if r.status_code == 429:
+        raise RuntimeError("rate_limit")
+    if r.status_code >= 400:
+        raise RuntimeError(f"http_{r.status_code}: {r.text[:200]}")
+    return (r.json()["choices"][0]["message"].get("content") or "").strip()
+
+
+_INFO_SYSTEM = (
+    "Ти — краєзнавець-помічник для археолога-аматора на Сумщині. Пиши українською, коротко (до 7 речень), без вступів. "
+    "ПРАВИЛА: спирайся ТІЛЬКИ на надані факти. Не вигадуй знахідок, дат, назв поселень чи доріг, яких немає у фактах. "
+    "Якщо про саме це місце нічого не відомо — прямо скажи це одним реченням. "
+    "Можеш додати одне речення із загальним історичним контекстом регіону, але лише про те, що точно відомо, "
+    "і познач його словами «Загальний контекст регіону:». "
+    "Структура: 1) найближчі населені пункти і що відомо про їхню історію; 2) історичні об'єкти поруч (якщо є); "
+    "3) що це означає для пошуку (за даними рельєфу). Не вживай форматування markdown."
+)
+
+
+@app.get("/api/point/info")
+def api_point_info(
+    lat: float = Query(..., ge=-85, le=85),
+    lon: float = Query(..., ge=-180, le=180),
+    kind: str = Query("", max_length=80),
+    score: float = Query(0.0),
+    delta_h: float = Query(0.0),
+    dist_water: int = Query(0),
+):
+    lat, lon = round(lat, 5), round(lon, 5)
+    ckey = (round(lat, 3), round(lon, 3), kind)
+    if ckey in _INFO_CACHE:
+        return _INFO_CACHE[ckey]
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FTimeout
+    warnings, rev, geo, hist = [], {}, [], []
+    pool = ThreadPoolExecutor(max_workers=4)
+    futs = {pool.submit(_info_reverse, lat, lon): "rev", pool.submit(_info_wiki_geo, lat, lon): "geo",
+            pool.submit(_info_overpass, lat, lon): "hist"}
+    try:
+        for fut in as_completed(futs, timeout=9):
+            try:
+                res = fut.result()
+                if futs[fut] == "rev": rev = res
+                elif futs[fut] == "geo": geo = res
+                else: hist = res
+            except Exception as exc:
+                print(f"[point_info] {futs[fut]}: {type(exc).__name__}: {exc}")
+                if futs[fut] != "hist":  # OSM historic часто недоступний з Render — це не помилка для користувача
+                    warnings.append(f"Джерело '{futs[fut]}' недоступне")
+    except FTimeout:
+        warnings.append("Частина джерел не відповіла вчасно")
+
+    # тексти двох найближчих статей Вікіпедії (паралельно)
+    geo = sorted(geo, key=lambda g: g.get("dist", 1e9))
+    top = geo[:2]
+    texts = {}
+    tfuts = {pool.submit(_info_wiki_text, g["pageid"]): g["pageid"] for g in top}
+    try:
+        for fut in as_completed(tfuts, timeout=10):
+            try:
+                texts[tfuts[fut]] = fut.result()
+            except Exception as exc:
+                print(f"[point_info] wiki_text: {exc}")
+    except FTimeout:
+        pass
+    pool.shutdown(wait=False)
+
+    sources = [{"title": g["title"], "url": f"https://uk.wikipedia.org/?curid={g['pageid']}",
+                "dist_m": int(g.get("dist", 0))} for g in geo[:6]]
+
+    facts = [f"Координати точки: {lat}, {lon}.",
+             f"Тип цілі за аналізом рельєфу: {kind or 'невідомо'}, бал {score}%, "
+             f"перевищення над низиною {delta_h} м, до води ~{dist_water} м."]
+    if rev.get("place"):
+        facts.append(f"Найближчий населений пункт за OSM: {rev['place']} ({rev.get('district') or ''}, {rev.get('state') or ''}).")
+    for g in geo[:6]:
+        txt = texts.get(g["pageid"])
+        line = f"Стаття Вікіпедії «{g['title']}», за {int(g.get('dist', 0))} м від точки."
+        facts.append(line + (f" Текст: {txt}" if txt else ""))
+    for h in hist:
+        facts.append(f"OSM історичний об'єкт: {h['kind']} {h['name']} — за {h['dist_m']} м.")
+    if not geo and not hist:
+        facts.append("У радіусі 8 км статей Вікіпедії та історичних об'єктів OSM не знайдено.")
+
+    summary, llm_error = None, None
+    try:
+        summary = _llm_chat(_INFO_SYSTEM, "ФАКТИ:\n" + "\n".join(facts) + "\n\nСкладіть довідку.")
+    except Exception as exc:
+        msg = str(exc)
+        llm_error = ("Не задано ключ LLM_API_KEY на Render" if msg == "no_key" else
+                     "Ліміт запитів до AI вичерпано, спробуйте за хвилину" if msg == "rate_limit" else
+                     f"Помилка AI: {msg}")
+        print(f"[point_info] LLM: {msg}")
+
+    payload = {"summary": summary, "llm_error": llm_error, "place": rev.get("place"),
+               "sources": sources, "historic_osm": hist, "warnings": warnings,
+               "facts_found": len(geo) + len(hist)}
+    if summary:  # кешуємо лише успішні відповіді
+        if len(_INFO_CACHE) > 500:
+            _INFO_CACHE.clear()
+        _INFO_CACHE[ckey] = payload
+    return payload
+
+
 @app.get("/test", response_class=HTMLResponse)
 def test_form():
     """
@@ -1856,7 +2042,7 @@ def get_map(
         research_url = f"{PUBLIC_BASE_URL}/research?lat={pt['lat']}&lon={pt['lon']}&radius_km=3"
 
         popup_html = f"""
-        <div style='font-family: sans-serif; width: 230px;'>
+        <div style='font-family: sans-serif; width: 260px;'>
             <h4 style='margin:0 0 5px 0; color:#d9534f;'>Ціль #{idx} (Бал: {pt['score']}%)</h4>
             <b>Тип:</b> {type_label}<br>
             <b>Висота над низиною:</b> +{pt['delta_h_m']} м<br>
@@ -1865,7 +2051,11 @@ def get_map(
             {spring_line}
             {hollow_line}
             <b>Схил / Сонце:</b> {pt['aspect_deg']}° ({int(pt['sun_score'] * 100)}%)<br>
-            <a href='{research_url}' target='_blank'>🔎 Що писали про це місце (AI)</a>
+            <button onclick="geoInfo(this)" data-lat="{pt['lat']}" data-lon="{pt['lon']}"
+                data-kind="{type_label}" data-score="{pt['score']}" data-dh="{pt['delta_h_m']}" data-dw="{pt['dist_water_m']}"
+                style="margin-top:6px;padding:6px 10px;border:0;border-radius:6px;background:#2c7be5;color:#fff;font-size:13px;">
+                📜 Історична довідка</button>
+            <div class="geo-info" style="margin-top:6px;max-height:230px;overflow:auto;font-size:12px;line-height:1.35;"></div>
         </div>
         """
 
@@ -1876,7 +2066,7 @@ def get_map(
             fill=True,
             fill_color=color,
             fill_opacity=0.9,
-            popup=folium.Popup(popup_html, max_width=260),
+            popup=folium.Popup(popup_html, max_width=300),
         ).add_to(m)
 
     if show_harvest:
@@ -1960,5 +2150,28 @@ def get_map(
             f"}});</script>\n"
         )
         html = html.replace("</body>", fix_script + "</body>", 1)
+        info_script = (
+            "<script>var __geoMap = " + map_var + ";\n"
+            "function geoEsc(s){return String(s).replace(/[&<>\"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',\"'\":'&#39;'}[c];});}\n"
+            "function geoInfo(btn){\n"
+            "  var box=btn.parentElement.querySelector('.geo-info'), d=btn.dataset, t0=Date.now();\n"
+            "  btn.disabled=true; btn.style.opacity=0.6;\n"
+            "  var tm=setInterval(function(){box.textContent='⏳ Збираю відомості… '+Math.round((Date.now()-t0)/1000)+' с';},500);\n"
+            "  box.textContent='⏳ Збираю відомості…';\n"
+            "  var q='lat='+d.lat+'&lon='+d.lon+'&kind='+encodeURIComponent(d.kind)+'&score='+d.score+'&delta_h='+d.dh+'&dist_water='+d.dw;\n"
+            "  fetch('" + PUBLIC_BASE_URL + "/api/point/info?'+q).then(function(r){if(!r.ok)throw new Error('HTTP '+r.status);return r.json();})\n"
+            "  .then(function(j){\n"
+            "    var h='';\n"
+            "    if(j.summary) h+='<div>'+geoEsc(j.summary).replace(/\\n/g,'<br>')+'</div>';\n"
+            "    else h+='<div style=\"color:#d9534f\">'+geoEsc(j.llm_error||'AI не відповів')+'</div>';\n"
+            "    if(j.sources&&j.sources.length){h+='<div style=\"margin-top:6px\"><b>Джерела (Вікіпедія):</b><br>';\n"
+            "      j.sources.forEach(function(s){h+='<a href=\"'+s.url+'\" target=\"_blank\">'+geoEsc(s.title)+'</a> <span style=\"opacity:.6\">'+s.dist_m+' м</span><br>';});h+='</div>';}\n"
+            "    h+='<div style=\"margin-top:6px;opacity:.6\">AI-довідка зі знайдених джерел. Це не доказ наявності пам\u2019ятки — перевіряйте.</div>';\n"
+            "    box.innerHTML=h; btn.textContent='🔄 Оновити'; btn.disabled=false; btn.style.opacity=1;\n"
+            "  }).catch(function(e){box.textContent='Помилка: '+e.message+'. Сервер, можливо, прокидається — спробуйте ще раз.';btn.disabled=false;btn.style.opacity=1;})\n"
+            "  .finally(function(){clearInterval(tm); try{if(__geoMap._popup)__geoMap._popup.update();}catch(e){}});\n"
+            "}</script>\n"
+        )
+        html = html.replace("</body>", info_script + "</body>", 1)
 
     return HTMLResponse(content=html)
