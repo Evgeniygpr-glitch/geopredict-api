@@ -275,6 +275,28 @@ app.add_middleware(
 # тому відносні посилання не працюють). Можна перекрити змінною PUBLIC_BASE_URL.
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "https://geopredict-api.onrender.com").rstrip("/")
 
+# Дані розробника для юридичних сторінок і User-Agent (політики Nominatim/Wikimedia вимагають контакт).
+APP_NAME = os.environ.get("APP_NAME", "GeoPredict")
+DEVELOPER_NAME = os.environ.get("DEVELOPER_NAME", "")
+CONTACT_EMAIL = os.environ.get("CONTACT_EMAIL", "")
+_UA = f"{APP_NAME}/1.0 (archaeology research helper{'; ' + CONTACT_EMAIL if CONTACT_EMAIL else ''})"
+
+# Публічний Nominatim: максимум 1 запит/с на весь застосунок, автодоповнення заборонене.
+_nom_lock = threading.Lock()
+_nom_last = [0.0]
+
+
+def _nominatim_get(path: str, params: dict):
+    with _nom_lock:
+        wait = 1.1 - (time.time() - _nom_last[0])
+        if wait > 0:
+            time.sleep(wait)
+        try:
+            return requests.get(f"https://nominatim.openstreetmap.org/{path}", params=params,
+                                headers={"User-Agent": _UA}, timeout=(3, 8))
+        finally:
+            _nom_last[0] = time.time()
+
 # AI-дослідження зони (окремий файл research.py). Якщо файлу немає на GitHub —
 # решта застосунку працює як раніше, просто без цього розділу.
 try:
@@ -1271,14 +1293,9 @@ def _clean_place_query(q: str) -> str:
 
 
 def _nominatim_places(q: str) -> list:
-    resp = requests.get(
-        "https://nominatim.openstreetmap.org/search",
-        params={"q": q, "format": "jsonv2", "countrycodes": "ua",
-                "viewbox": SUMY_VIEWBOX, "bounded": 1, "limit": 20,
-                "addressdetails": 1, "accept-language": "uk", "dedupe": 1},
-        headers={"User-Agent": "GeoPredict/1.0 (archaeology research helper)"},
-        timeout=12,
-    )
+    resp = _nominatim_get("search", {"q": q, "format": "jsonv2", "countrycodes": "ua",
+                                     "viewbox": SUMY_VIEWBOX, "bounded": 1, "limit": 20,
+                                     "addressdetails": 1, "accept-language": "uk", "dedupe": 1})
     resp.raise_for_status()
     out = []
     for item in resp.json():
@@ -1318,7 +1335,7 @@ def _overpass_places(q: str) -> list:
     for url in _OVERPASS_URLS:
         try:
             r = requests.post(url, data={"data": query}, timeout=(3, 8),
-                              headers={"User-Agent": "GeoPredict/1.0"})
+                              headers={"User-Agent": _UA})
             r.raise_for_status()
             elements = r.json().get("elements", [])
             break
@@ -1344,7 +1361,7 @@ def _photon_places(q: str) -> list:
     resp = requests.get(
         "https://photon.komoot.io/api/",
         params={"q": q, "bbox": "32.4,49.9,35.8,52.2", "limit": 15, "osm_tag": "place"},
-        headers={"User-Agent": "GeoPredict/1.0"}, timeout=(3, 7),
+        headers={"User-Agent": _UA}, timeout=(3, 7),
     )
     resp.raise_for_status()
     out = []
@@ -1369,7 +1386,7 @@ def api_places_search(q: str = Query(..., min_length=2)):
     Nominatim + доповнення з Overpass (частковий збіг назви, дрібні села).
     """
     q_clean = _clean_place_query(q)
-    if len(q_clean) < 2:
+    if len(q_clean) < 3:
         return {"results": []}
     if q_clean.lower() in _PLACES_CACHE:
         return {"results": _PLACES_CACHE[q_clean.lower()]}
@@ -1423,7 +1440,7 @@ def api_places_search(q: str = Query(..., min_length=2)):
 
 _INFO_CACHE = {}
 _WIKI_API = "https://uk.wikipedia.org/w/api.php"
-_WIKI_HEADERS = {"User-Agent": "GeoPredict/1.0 (archaeology research helper)"}
+_WIKI_HEADERS = {"User-Agent": _UA}
 
 
 def _hav_m(lat1, lon1, lat2, lon2) -> float:
@@ -1434,10 +1451,8 @@ def _hav_m(lat1, lon1, lat2, lon2) -> float:
 
 
 def _info_reverse(lat, lon) -> dict:
-    r = requests.get("https://nominatim.openstreetmap.org/reverse",
-                     params={"lat": lat, "lon": lon, "zoom": 14, "format": "jsonv2",
-                             "accept-language": "uk", "addressdetails": 1},
-                     headers=_WIKI_HEADERS, timeout=(3, 8))
+    r = _nominatim_get("reverse", {"lat": lat, "lon": lon, "zoom": 14, "format": "jsonv2",
+                                   "accept-language": "uk", "addressdetails": 1})
     r.raise_for_status()
     a = r.json().get("address", {})
     place = a.get("village") or a.get("hamlet") or a.get("town") or a.get("city") or a.get("suburb")
@@ -1468,7 +1483,7 @@ def _info_wiki_text(pageid: int) -> str:
 
 def _info_overpass(lat, lon) -> list:
     q = (f'[out:json][timeout:6];nwr(around:2500,{lat},{lon})["historic"];out center 15;')
-    r = requests.post(_OVERPASS_URLS[1], data={"data": q}, timeout=(3, 8), headers={"User-Agent": "GeoPredict/1.0"})
+    r = requests.post(_OVERPASS_URLS[1], data={"data": q}, timeout=(3, 8), headers={"User-Agent": _UA})
     r.raise_for_status()
     out = []
     for el in r.json().get("elements", []):
@@ -1528,6 +1543,14 @@ _INFO_SYSTEM = (
     "Структура: 1) найближчі населені пункти і що відомо про їхню історію; 2) історичні об'єкти поруч (якщо є); "
     "3) що це означає для пошуку (за даними рельєфу). Не вживай форматування markdown."
 )
+
+
+@app.get("/api/point/report")
+def api_point_report(lat: float = Query(...), lon: float = Query(...),
+                     reason: str = Query("", max_length=300)):
+    """Скарга на помилкову/недоречну AI-довідку (вимога Google Play до застосунків з генеративним AI)."""
+    print(f"[REPORT] lat={lat} lon={lon} reason={reason!r}")
+    return {"ok": True}
 
 
 @app.get("/api/point/info")
@@ -1615,6 +1638,200 @@ def api_point_info(
     return payload
 
 
+# --------------------------------------------------------------------------
+# Юридичні сторінки для Google Play: /privacy, /privacy/en, /terms, /credits
+# --------------------------------------------------------------------------
+# Налаштування на Render: APP_NAME, DEVELOPER_NAME, CONTACT_EMAIL.
+_LEGAL_DATE = "13.10.2026"
+_LEGAL_CSS = ("body{font-family:sans-serif;max-width:760px;margin:24px auto;padding:0 16px;line-height:1.5}"
+              "h1{font-size:24px}h2{font-size:18px;margin-top:26px}table{border-collapse:collapse;width:100%;font-size:14px}"
+              "td,th{border:1px solid #8885;padding:6px;text-align:left;vertical-align:top}"
+              ".muted{opacity:.7;font-size:13px}@media(prefers-color-scheme:dark){body{background:#111;color:#ddd}a{color:#7ab7ff}}")
+
+
+def _legal_page(title: str, body: str, lang: str = "uk") -> HTMLResponse:
+    return HTMLResponse(f'<!DOCTYPE html><html lang="{lang}"><head><meta charset="utf-8">'
+                        f'<meta name="viewport" content="width=device-width, initial-scale=1">'
+                        f'<title>{title}</title><style>{_LEGAL_CSS}</style></head><body>{body}</body></html>')
+
+
+def _contact_html(lang: str) -> str:
+    who = DEVELOPER_NAME or ("[вкажіть DEVELOPER_NAME у Render]" if lang == "uk" else "[set DEVELOPER_NAME in Render]")
+    mail = (f'<a href="mailto:{CONTACT_EMAIL}">{CONTACT_EMAIL}</a>' if CONTACT_EMAIL else
+            ("[вкажіть CONTACT_EMAIL у Render]" if lang == "uk" else "[set CONTACT_EMAIL in Render]"))
+    return f"{who}, {mail}"
+
+
+# (сервіс, що передається, посилання на політику)
+_THIRD_PARTIES = [
+    ("Render (хостинг сервера / hosting)", "IP-адреса, час і URL запиту (журнали сервера)", "https://render.com/privacy"),
+    ("OpenStreetMap Nominatim", "Текст пошуку населеного пункту; координати точки / Search text; point coordinates",
+     "https://osmfoundation.org/wiki/Privacy_Policy"),
+    ("Photon (komoot)", "Текст пошуку населеного пункту / Search text", "https://www.komoot.com/privacy"),
+    ("Overpass API (OpenStreetMap)", "Координати та радіус / Coordinates and radius", "https://osmfoundation.org/wiki/Privacy_Policy"),
+    ("Wikipedia (Wikimedia)", "Координати точки / Point coordinates", "https://foundation.wikimedia.org/wiki/Policy:Privacy_policy"),
+    ("Groq (AI)", "Координати точки, параметри рельєфу, уривки статей Вікіпедії / Coordinates, terrain parameters, Wikipedia excerpts",
+     "https://groq.com/privacy-policy"),
+    ("Copernicus / Sentinel Hub", "Межі області пошуку / Search-area bounds", "https://dataspace.copernicus.eu"),
+    ("NASA GIBS", "Межі області / Area bounds", "https://www.earthdata.nasa.gov/engage/privacy-policy"),
+    ("EOX / s2maps (супутникова підкладка / satellite basemap)", "Запити тайлів з вашого пристрою (IP) / Tile requests (IP)",
+     "https://eox.at"),
+]
+
+
+def _tp_table() -> str:
+    rows = "".join(f'<tr><td>{n}</td><td>{d}</td><td><a href="{u}" rel="noopener">link</a></td></tr>' for n, d, u in _THIRD_PARTIES)
+    return f"<table><tr><th>Service</th><th>Data / Дані</th><th>Policy</th></tr>{rows}</table>"
+
+
+@app.get("/privacy", response_class=HTMLResponse)
+def privacy_uk():
+    body = f"""
+<h1>Політика конфіденційності — {APP_NAME}</h1>
+<p class="muted">Остання зміна: {_LEGAL_DATE}</p>
+<p>{APP_NAME} — застосунок, який за відкритими даними рельєфу, супутниковими знімками та історичними джерелами підказує
+місця, цікаві для аматорського археологічного та краєзнавчого вивчення. Контакт розробника: {_contact_html("uk")}.</p>
+
+<h2>1. Які дані ми обробляємо</h2>
+<ul>
+<li><b>Координати центру пошуку, радіус і вибрані параметри</b> — надсилаються на наш сервер, щоб розрахувати результат.
+Якщо ви обираєте поточне місцезнаходження пристрою як центр, це ваші координати.</li>
+<li><b>Текст пошуку населеного пункту</b> — передається службам геокодування (див. розділ 3).</li>
+<li><b>Координати точки</b>, для якої ви запитуєте історичну довідку.</li>
+<li><b>Технічні журнали сервера</b>: IP-адреса, час, URL запиту (їх веде хостинг-провайдер Render).</li>
+<li><b>Повідомлення про помилки AI-довідки</b>: координати точки та текст, який ви самі ввели.</li>
+</ul>
+<p>Ми <b>не збираємо</b> імена, e-mail, номери телефонів, контакти, фотографії, рекламні ідентифікатори, не ведемо облікових записів,
+не показуємо рекламу і не продаємо дані.</p>
+
+<h2>2. Навіщо</h2>
+<p>Лише для роботи функцій застосунку: розрахунок результатів, пошук населених пунктів, формування історичної довідки,
+розв'язання технічних проблем і покращення якості AI-довідок за вашими скаргами.</p>
+
+<h2>3. Сторонні сервіси, яким передаються дані</h2>
+<p>Для роботи функцій наш сервер звертається до зовнішніх сервісів. Вони обробляють дані за власними політиками:</p>
+{_tp_table()}
+<p class="muted">Дані, які ми передаємо цим сервісам, не містять вашого імені чи облікового запису.</p>
+
+<h2>4. AI-довідка</h2>
+<p>Історична довідка формується мовною моделлю на основі знайдених публічних джерел. Вона може містити неточності й не є
+доказом наявності пам'ятки. Не вводьте в застосунок персональні дані. Ви можете повідомити про помилкову довідку кнопкою
+«Повідомити про помилку».</p>
+
+<h2>5. Зберігання</h2>
+<p>Результати розрахунків тимчасово зберігаються в пам'яті сервера й скидаються при його перезапуску. Журнали зберігаються
+стільки, скільки передбачає політика хостинг-провайдера. Скарги на AI-довідку зберігаються в журналах сервера.</p>
+
+<h2>6. Ваші права</h2>
+<p>Ви можете звернутися за адресою вище, щоб дізнатися, які дані про вас можуть зберігатися, або попросити їх видалити
+(зокрема за GDPR та законодавством України про захист персональних даних). Оскільки облікових записів немає, ми зазвичай
+не можемо пов'язати журнали з конкретною особою без додаткових відомостей від вас (наприклад, IP-адреси й часу запиту).</p>
+
+<h2>7. Діти</h2>
+<p>Застосунок не призначений для дітей віком до 13 років (до 16 — у країнах ЄС). Ми свідомо не збираємо дані дітей.</p>
+
+<h2>8. Зміни</h2>
+<p>Ми можемо оновлювати цю політику; актуальна версія завжди доступна за цією адресою, дата зміни вказана вгорі.</p>
+<p><a href="/privacy/en">English version</a> · <a href="/terms">Умови використання</a> · <a href="/credits">Джерела даних</a></p>
+"""
+    return _legal_page(f"Політика конфіденційності — {APP_NAME}", body, "uk")
+
+
+@app.get("/privacy/en", response_class=HTMLResponse)
+def privacy_en():
+    body = f"""
+<h1>Privacy Policy — {APP_NAME}</h1>
+<p class="muted">Last updated: {_LEGAL_DATE}</p>
+<p>{APP_NAME} uses open terrain data, satellite imagery and public historical sources to suggest places of interest for amateur
+archaeological and local-history research. Developer contact: {_contact_html("en")}.</p>
+
+<h2>1. Data we process</h2>
+<ul>
+<li><b>Search-centre coordinates, radius and selected options</b> — sent to our server to compute results. If you choose your
+device's current location as the centre, these are your coordinates.</li>
+<li><b>Place-name search text</b> — forwarded to geocoding services (see section 3).</li>
+<li><b>Coordinates of a point</b> for which you request a historical note.</li>
+<li><b>Server logs</b>: IP address, time, request URL (kept by our hosting provider, Render).</li>
+<li><b>AI-note reports</b>: point coordinates and any text you type.</li>
+</ul>
+<p>We do <b>not</b> collect names, e-mail addresses, phone numbers, contacts, photos or advertising IDs. There are no user accounts
+and no ads, and we do not sell data.</p>
+
+<h2>2. Purpose</h2>
+<p>Only to provide the app's features: computing results, place search, generating historical notes, troubleshooting and improving
+AI notes based on your reports.</p>
+
+<h2>3. Third-party services receiving data</h2>
+{_tp_table()}
+<p class="muted">Data we send to these services contains no name or account information.</p>
+
+<h2>4. AI-generated notes</h2>
+<p>Historical notes are generated by a language model from public sources found for the location. They may be inaccurate and are
+not proof that a monument exists. Do not enter personal data. Use "Report a problem" to flag a bad note.</p>
+
+<h2>5. Retention</h2>
+<p>Computation results are cached in server memory and cleared on restart. Logs are kept according to the hosting provider's
+policy. Reports are stored in server logs.</p>
+
+<h2>6. Your rights</h2>
+<p>Contact us at the address above to ask what data about you may be held or to request deletion (including under GDPR). Because
+there are no accounts, we usually cannot link logs to a person without extra details from you (e.g. IP address and request time).</p>
+
+<h2>7. Children</h2>
+<p>The app is not directed to children under 13 (16 in the EU). We do not knowingly collect children's data.</p>
+
+<h2>8. Changes</h2>
+<p>We may update this policy; the current version is always at this URL.</p>
+<p><a href="/privacy">Українська версія</a> · <a href="/terms">Terms</a> · <a href="/credits">Data sources</a></p>
+"""
+    return _legal_page(f"Privacy Policy — {APP_NAME}", body, "en")
+
+
+@app.get("/terms", response_class=HTMLResponse)
+def terms_page():
+    body = f"""
+<h1>Умови використання — {APP_NAME}</h1>
+<p class="muted">Остання зміна: {_LEGAL_DATE}. Контакт: {_contact_html("uk")}.</p>
+<h2>1. Призначення</h2>
+<p>Застосунок — інформаційний помічник для аматорського вивчення краєзнавства. Результати — це <b>гіпотези на основі рельєфу й
+відкритих даних</b>, а не підтвердження археологічних пам'яток. Точність не гарантується.</p>
+<h2>2. Закон і охорона спадщини</h2>
+<p>Застосунок <b>не закликає</b> до незаконних розкопок, використання металодетекторів на охоронюваних територіях чи
+пошкодження пам'яток. Проведення пошукових і розкопувальних робіт в Україні потребує дозволу уповноважених органів та
+дотримання закону про охорону археологічної спадщини; за порушення передбачена відповідальність. Ви самі відповідаєте за
+дотримання законів і за отримання згоди власників/користувачів землі. Якщо ви знайшли можливий об'єкт — повідомте
+уповноважений орган або місцевий краєзнавчий музей і не пошкоджуйте його.</p>
+<h2>3. Безпека</h2>
+<p>Не заходьте на приватні, заміновані чи небезпечні ділянки, у зони з обмеженим доступом. Дані рельєфу можуть бути неточними.</p>
+<h2>4. AI та сторонні дані</h2>
+<p>Історичні довідки формує мовна модель із публічних джерел і можуть містити помилки. Дані сторонніх сервісів надаються «як є».
+Перелік джерел і ліцензій: <a href="/credits">/credits</a>.</p>
+<h2>5. Відповідальність</h2>
+<p>Застосунок надається «як є», без гарантій. Розробник не відповідає за збитки, пов'язані з використанням результатів.</p>
+<p><a href="/privacy">Політика конфіденційності</a></p>
+"""
+    return _legal_page(f"Умови використання — {APP_NAME}", body, "uk")
+
+
+@app.get("/credits", response_class=HTMLResponse)
+def credits_page():
+    body = f"""
+<h1>Джерела даних і ліцензії / Data sources</h1>
+<ul>
+<li>Map data © <a href="https://www.openstreetmap.org/copyright">OpenStreetMap contributors</a> (ODbL) — пошук населених пунктів (Nominatim, Overpass), Photon © komoot.</li>
+<li>Тексти статей: <a href="https://uk.wikipedia.org">Вікіпедія</a>, ліцензія
+<a href="https://creativecommons.org/licenses/by-sa/4.0/">CC BY-SA 4.0</a>. AI-довідка є стислим викладом цих статей; посилання на оригінали наведені біля довідки.</li>
+<li>Contains modified Copernicus Sentinel data (ESA / European Union) — NDVI через Copernicus Data Space / Sentinel Hub.</li>
+<li>Висоти: SRTM (NASA / USGS).</li>
+<li>Imagery provided by NASA GIBS / EOSDIS (запасний шар NDVI).</li>
+<li>Супутникова підкладка: Sentinel-2 cloudless by <a href="https://s2maps.eu">EOX</a> (CC BY 4.0), містить змінені дані Copernicus Sentinel.</li>
+<li>AI: Groq (мовна модель).</li>
+</ul>
+<p><a href="/privacy">Політика конфіденційності</a> · <a href="/terms">Умови використання</a></p>
+"""
+    return _legal_page("Джерела даних", body, "uk")
+
+
 @app.get("/test", response_class=HTMLResponse)
 def test_form():
     """
@@ -1657,7 +1874,10 @@ def test_form():
         <h2>📍 Оберіть місце пошуку</h2>
 
         <label for="place">Населений пункт (місто, село, хутір — Сумщина)</label>
-        <input id="place" type="text" placeholder="напр. Ромни, Кролевець, будь-яке село...">
+        <div style="display:flex;gap:6px;">
+            <input id="place" type="text" placeholder="напр. Ромни, Кролевець, будь-яке село...">
+            <button type="button" id="searchBtn" style="padding:0 14px;">Знайти</button>
+        </div>
         <div class="suggestions" id="suggestions"></div>
         <div class="picked" id="picked" style="display:none;"></div>
 
@@ -1700,12 +1920,14 @@ def test_form():
             const $ = id => document.getElementById(id);
             let searchTimer = null;
 
-            $('place').addEventListener('input', () => {
-                clearTimeout(searchTimer);
+            // Публічний Nominatim забороняє автодоповнення — шукаємо лише по кнопці / Enter.
+            function doSearch() {
                 const q = $('place').value.trim();
-                if (q.length < 2) { $('suggestions').innerHTML = ''; return; }
-                searchTimer = setTimeout(() => runSearch(q), 700);
-            });
+                if (q.length < 3) { $('suggestions').innerHTML = '<div class="muted">Введіть щонайменше 3 літери.</div>'; return; }
+                runSearch(q);
+            }
+            $('searchBtn').addEventListener('click', doSearch);
+            $('place').addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); doSearch(); } });
 
             let searchCtl = null;
             async function runSearch(q) {
@@ -1933,6 +2155,28 @@ def api_analyze(
     }
 
 
+from html import escape as _html_escape
+
+
+@lru_cache(maxsize=32)
+def get_place_labels(lat: float, lon: float, radius_km: float):
+    """Назви населених пунктів з OSM у квадраті пошуку (підписи поверх супутника)."""
+    dlat = radius_km / 111.0
+    dlon = radius_km / (111.0 * math.cos(math.radians(lat)))
+    q = ('[out:json][timeout:10];'
+         'node["place"~"^(village|hamlet|town|city|isolated_dwelling)$"]["name"]'
+         f'({lat - dlat},{lon - dlon},{lat + dlat},{lon + dlon});out 300;')
+    r = requests.post(_OVERPASS_URLS[0], data={"data": q}, timeout=(3, 12), headers={"User-Agent": _UA})
+    r.raise_for_status()
+    out = []
+    for el in r.json().get("elements", []):
+        t = el.get("tags", {})
+        name = t.get("name:uk") or t.get("name")
+        if name and el.get("lat") is not None:
+            out.append({"name": name, "kind": t.get("place", ""), "lat": el["lat"], "lon": el["lon"]})
+    return tuple(out)
+
+
 @app.api_route("/map", methods=["GET", "HEAD"], response_class=HTMLResponse)
 def get_map(
     lat: float = Query(50.75, ge=-85, le=85),
@@ -1950,12 +2194,7 @@ def get_map(
     lon_delta = radius_km / (111.0 * math.cos(math.radians(lat)))
     bounds = [[lat - lat_delta, lon - lon_delta], [lat + lat_delta, lon + lon_delta]]
 
-    m = folium.Map(
-        location=[lat, lon],
-        tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
-        attr="Esri World Imagery",
-        name="🌍 Супутник HD (Esri)",
-    )
+    m = folium.Map(location=[lat, lon], tiles=None)
     # Одразу вписуємо вид карти РІВНО в квадрат пошуку — інакше Leaflet
     # підвантажує NDVI/супутникові тайли з набагато ширшої області, ніж
     # реально потрібно, і це зайве навантаження на телефон і на Copernicus.
@@ -1963,17 +2202,28 @@ def get_map(
     m.options["maxBounds"] = bounds
     m.options["maxBoundsViscosity"] = 0.6  # м'яко "пружинить" назад, а не жорстко блокує
 
+    # Єдина підкладка: супутник Sentinel-2 cloudless (EOX, безкоштовно, без ключа)
     folium.TileLayer(
-        tiles="https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}",
-        attr="Google Maps",
-        name="🛰️ Google Hybrid (з назвами)",
+        tiles="https://tiles.maps.eox.at/wmts/1.0.0/s2cloudless-2020_3857/default/GoogleMapsCompatible/{z}/{y}/{x}.jpg",
+        attr='Sentinel-2 cloudless by <a href="https://s2maps.eu">EOX</a> (CC BY 4.0), contains modified Copernicus Sentinel data',
+        name="🛰️ Супутник (Sentinel-2)",
+        show=True,
     ).add_to(m)
 
-    folium.TileLayer(
-        tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Topo_Map/MapServer/tile/{z}/{y}/{x}",
-        attr="Esri World Topo",
-        name="🗺️ Топо-карта (Esri Topo)",
-    ).add_to(m)
+    # Підписи населених пунктів — частина тієї ж підкладки (вмикається разом із нею)
+    label_fg = folium.FeatureGroup(name="🏷️ Назви населених пунктів", show=True)
+    try:
+        for p_ in get_place_labels(round(lat, 5), round(lon, 5), round(radius_km, 2)):
+            folium.Marker(
+                [p_["lat"], p_["lon"]],
+                icon=folium.DivIcon(html=(
+                    "<div style='font-size:11px;color:#fff;white-space:nowrap;"
+                    "text-shadow:0 0 3px #000,0 0 3px #000,0 0 3px #000'>"
+                    f"{_html_escape(p_['name'])}</div>")),
+            ).add_to(label_fg)
+    except Exception as exc:
+        print(f"[labels] Overpass недоступний: {exc}")
+    label_fg.add_to(m)
 
     if COPERNICUS_INSTANCE_ID:
         sh_url = f"https://sh.dataspace.copernicus.eu/ogc/wms/{COPERNICUS_INSTANCE_ID}"
@@ -1985,11 +2235,12 @@ def get_map(
             url=sh_url,
             layers="VEGETATION_INDEX",
             name="🌱 NDVI Sentinel-2 (Copernicus, 10м)",
+            show=False,
             fmt="image/png",
             transparent=True,
             overlay=True,
             opacity=0.75,
-            attr="Copernicus Sentinel Data / Sentinel Hub",
+            attr="Contains modified Copernicus Sentinel data / Sentinel Hub",
             TIME=time_range,
             PRIORITY="mostRecent",
             MAXCC=MAX_CLOUD_PCT,
@@ -2001,11 +2252,12 @@ def get_map(
             url="https://gibs.earthdata.nasa.gov/wms/epsg3857/best/wms.cgi",
             layers="MODIS_Terra_NDVI_8Day",
             name="🌱 NDVI MODIS (запасний, 250-500м)",
+            show=False,
             fmt="image/png",
             transparent=True,
             overlay=True,
             opacity=0.75,
-            attr="NASA GIBS / EOSDIS",
+            attr="Imagery provided by NASA GIBS / EOSDIS",
         ).add_to(m)
 
     folium.Circle(
@@ -2170,8 +2422,14 @@ def get_map(
         info_script = (
             "<script>var __geoMap = " + map_var + ";\n"
             "function geoEsc(s){return String(s).replace(/[&<>\"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',\"'\":'&#39;'}[c];});}\n"
+            "function geoReport(a){var r=prompt('Що не так із довідкою? (необов\u2019язково)')||'';\n"
+            "  fetch('" + PUBLIC_BASE_URL + "/api/point/report?lat='+a.dataset.lat+'&lon='+a.dataset.lon+'&reason='+encodeURIComponent(r.slice(0,300))).then(function(){a.textContent='✅ Дякуємо, передано';});}\n"
+            "try{__geoMap.attributionControl.addAttribution('© OpenStreetMap contributors · Wikipedia (CC BY-SA 4.0) · Contains modified Copernicus Sentinel data · SRTM/NASA · <a href=\"" + PUBLIC_BASE_URL + "/credits\" target=\"_blank\">Джерела</a>');}catch(e){}\n"
             "function geoInfo(btn){\n"
             "  var box=btn.parentElement.querySelector('.geo-info'), d=btn.dataset, t0=Date.now();\n"
+            "  var ok=window.__geoOk===true; try{ok=ok||localStorage.getItem('geoAiOk')==='1';}catch(e){}\n"
+            "  if(!ok){box.innerHTML='<div>Для довідки координати точки буде надіслано до Wikipedia, OpenStreetMap та AI-сервісу Groq (США). <a href=\"" + PUBLIC_BASE_URL + "/privacy\" target=\"_blank\">Політика конфіденційності</a></div><button style=\"margin-top:6px;padding:5px 9px;border:0;border-radius:6px;background:#2f9e44;color:#fff\">Погоджуюсь</button>';\n"
+            "    box.querySelector('button').onclick=function(){window.__geoOk=true;try{localStorage.setItem('geoAiOk','1');}catch(e){} geoInfo(btn);}; return;}\n"
             "  btn.disabled=true; btn.style.opacity=0.6;\n"
             "  var tm=setInterval(function(){box.textContent='⏳ Збираю відомості… '+Math.round((Date.now()-t0)/1000)+' с';},500);\n"
             "  box.textContent='⏳ Збираю відомості…';\n"
@@ -2183,7 +2441,7 @@ def get_map(
             "    else h+='<div style=\"color:#d9534f\">'+geoEsc(j.llm_error||'AI не відповів')+'</div>';\n"
             "    if(j.sources&&j.sources.length){h+='<div style=\"margin-top:6px\"><b>Джерела (Вікіпедія):</b><br>';\n"
             "      j.sources.forEach(function(s){h+='<a href=\"'+s.url+'\" target=\"_blank\">'+geoEsc(s.title)+'</a> <span style=\"opacity:.6\">'+s.dist_m+' м</span><br>';});h+='</div>';}\n"
-            "    h+='<div style=\"margin-top:6px;opacity:.6\">AI-довідка зі знайдених джерел. Це не доказ наявності пам\u2019ятки — перевіряйте.</div>';\n"
+            "    h+='<div style=\"margin-top:6px;opacity:.6\">AI-довідка зі знайдених джерел. Це не доказ наявності пам\u2019ятки — перевіряйте. <a href=\"#\" onclick=\"geoReport(this);return false;\" data-lat=\"'+d.lat+'\" data-lon=\"'+d.lon+'\">⚠️ Повідомити про помилку</a></div>';\n"
             "    box.innerHTML=h; btn.textContent='🔄 Оновити'; btn.disabled=false; btn.style.opacity=1;\n"
             "  }).catch(function(e){box.textContent='Помилка: '+e.message+'. Сервер, можливо, прокидається — спробуйте ще раз.';btn.disabled=false;btn.style.opacity=1;})\n"
             "  .finally(function(){clearInterval(tm); try{if(__geoMap._popup)__geoMap._popup.update();}catch(e){}});\n"
