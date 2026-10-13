@@ -2158,23 +2158,54 @@ def api_analyze(
 from html import escape as _html_escape
 
 
+# Локальний список населених пунктів Сумщини (data/places_sumy.json), збирається
+# одноразово скриптом tools/build_places.py. Overpass з Render часто недоступний,
+# тому підписи беремо звідси — миттєво і надійно.
+_PLACES_LOCAL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "places_sumy.json")
+_PLACES_LOCAL = []
+try:
+    with open(_PLACES_LOCAL_PATH, "r", encoding="utf-8") as f:
+        _PLACES_LOCAL = json.load(f).get("places", [])
+    print(f"[places] Завантажено {len(_PLACES_LOCAL)} населених пунктів з локального файлу.")
+except FileNotFoundError:
+    print(f"[places] {_PLACES_LOCAL_PATH} не знайдено — підписи братимуться з Overpass.")
+except Exception as exc:
+    print(f"[places] Помилка читання локального файлу: {exc}")
+
+
 @lru_cache(maxsize=32)
 def get_place_labels(lat: float, lon: float, radius_km: float):
-    """Назви населених пунктів з OSM у квадраті пошуку (підписи поверх супутника)."""
+    """Населені пункти у квадраті пошуку (підписи поверх супутника)."""
     dlat = radius_km / 111.0
     dlon = radius_km / (111.0 * math.cos(math.radians(lat)))
-    q = ('[out:json][timeout:10];'
-         'node["place"~"^(village|hamlet|town|city|isolated_dwelling)$"]["name"]'
-         f'({lat - dlat},{lon - dlon},{lat + dlat},{lon + dlon});out 300;')
-    r = requests.post(_OVERPASS_URLS[0], data={"data": q}, timeout=(3, 12), headers={"User-Agent": _UA})
-    r.raise_for_status()
-    out = []
-    for el in r.json().get("elements", []):
-        t = el.get("tags", {})
-        name = t.get("name:uk") or t.get("name")
-        if name and el.get("lat") is not None:
-            out.append({"name": name, "kind": t.get("place", ""), "lat": el["lat"], "lon": el["lon"]})
-    return tuple(out)
+    lo_la, hi_la = lat - dlat, lat + dlat
+    lo_lo, hi_lo = lon - dlon, lon + dlon
+
+    if _PLACES_LOCAL:
+        return tuple(p for p in _PLACES_LOCAL
+                     if lo_la <= p["lat"] <= hi_la and lo_lo <= p["lon"] <= hi_lo)
+
+    q = ('[out:json][timeout:15];'
+         'nwr["place"~"^(city|town|village|hamlet|isolated_dwelling)$"]["name"]'
+         f'({lo_la},{lo_lo},{hi_la},{hi_lo});out center 400;')
+    last_exc = None
+    for url in _OVERPASS_URLS:
+        try:
+            r = requests.post(url, data={"data": q}, timeout=(3, 15), headers={"User-Agent": _UA})
+            r.raise_for_status()
+            out = []
+            for el in r.json().get("elements", []):
+                t = el.get("tags", {})
+                name = t.get("name:uk") or t.get("name")
+                la = el.get("lat") or (el.get("center") or {}).get("lat")
+                lo = el.get("lon") or (el.get("center") or {}).get("lon")
+                if name and la is not None and lo is not None:
+                    out.append({"name": name, "kind": t.get("place", ""), "lat": la, "lon": lo})
+            return tuple(out)
+        except Exception as exc:
+            last_exc = exc
+            print(f"[labels] Overpass {url}: {type(exc).__name__}")
+    raise RuntimeError(f"Overpass недоступний: {last_exc}")
 
 
 @app.api_route("/map", methods=["GET", "HEAD"], response_class=HTMLResponse)
@@ -2208,6 +2239,8 @@ def get_map(
         attr='Sentinel-2 cloudless by <a href="https://s2maps.eu">EOX</a> (CC BY 4.0), contains modified Copernicus Sentinel data',
         name="🛰️ Супутник (Sentinel-2)",
         show=True,
+        max_native_zoom=14,   # вище — Leaflet масштабує останній рівень, а не малює розмитий тайл
+        max_zoom=18,
     ).add_to(m)
 
     # Підписи населених пунктів — частина тієї ж підкладки (вмикається разом із нею)
