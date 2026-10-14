@@ -2324,10 +2324,10 @@ def get_place_labels(lat: float, lon: float, radius_km: float):
 _SCHUBERT_JS = """(function(){
 var sheets = __DATA__;
 var layers = sheets.map(function(s){ return L.imageOverlay(s.url, s.bounds, {opacity: 0.6}); });
-var ctl = L.control({position: 'bottomleft'});
+var ctl = L.control({position: 'topleft'});
 ctl.onAdd = function(){
   var d = L.DomUtil.create('div', 'leaflet-bar');
-  d.style.cssText = 'background:#fff;padding:6px 8px;border-radius:6px;font-size:12px;color:#222;max-width:200px;max-height:45vh;overflow:auto';
+  d.style.cssText = 'background:#fff;padding:6px 8px;border-radius:6px;font-size:12px;color:#222;max-width:200px;max-height:45vh;overflow:auto;z-index:1000;box-shadow:0 1px 5px rgba(0,0,0,.4)';
   var h = '<b>Старі карти</b><br>Завантажено листів: __TOTAL__<br>' + (sheets.length ? '' : 'Для цієї області листів немає<br>');
   sheets.forEach(function(s, i){ h += '<label><input type="checkbox" data-i="' + i + '"> ' + s.name + '</label><br>'; });
   h += 'Прозорість <input type="range" id="sch_op" min="0" max="100" value="60" style="width:110px">';
