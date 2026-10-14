@@ -1223,6 +1223,7 @@ def loading_page():
         <div id="stage">Запуск…</div>
         <div class="muted" id="detail"></div>
         <div class="muted" id="timer"></div>
+        <div class="muted" id="sch"></div>
         <div class="muted warn" id="warn"></div>
         <div class="err" id="err"></div>
         <div class="muted">Перший запуск після простою може тривати до хвилини: Render «прокидає» сервер і качає дані SRTM.</div>
@@ -1268,6 +1269,12 @@ def loading_page():
                 setTimeout(poll, 3000);
             }
         }
+        fetch('/api/schubert/status' + qs).then(function(r){return r.json();}).then(function(j){
+            var t = 'Старі карти: завантажено листів ' + j.loaded.length + ', для цієї області ' + j.near.length;
+            if (!j.dir_exists) t += '<br>Папка data/schubert не знайдена на сервері';
+            if (j.loaded.length === 0 && j.log.length) t += '<br>' + j.log.join('<br>');
+            $('sch').innerHTML = t;
+        }).catch(function(){ $('sch').textContent = 'Старі карти: не вдалося перевірити статус'; });
         start();
     </script></body></html>
     """
@@ -2202,6 +2209,14 @@ def _read_ozi_bounds(map_path, img_path):
     return (min(lats), min(lons)), (max(lats), max(lons))
 
 
+SCHUBERT_LOG = []
+
+
+def _slog(msg):
+    print(msg, flush=True)
+    SCHUBERT_LOG.append(msg)
+
+
 def _read_sidecar_bounds(json_path):
     """Межі листа з <назва>.json, який створює tools/prep_sheets.py з точок QGIS."""
     with open(json_path, encoding="utf-8") as f:
@@ -2212,7 +2227,7 @@ def _read_sidecar_bounds(json_path):
 def _scan_schubert_sheets():
     sheets = []
     if not os.path.isdir(SCHUBERT_DIR):
-        print("[schubert] Папка data/schubert не знайдена — листи не підключено.")
+        _slog("[schubert] Папка data/schubert не знайдена — листи не підключено.")
         return sheets
     seen_ids = set()
     for fn in sorted(os.listdir(SCHUBERT_DIR)):
@@ -2228,21 +2243,22 @@ def _scan_schubert_sheets():
             elif os.path.exists(side_map):
                 bounds = _read_ozi_bounds(side_map, img)
             else:
-                print(f"[schubert] Для {fn} немає прив'язки (.json або .map) — пропускаю.")
+                _slog(f"[schubert] Для {fn} немає прив'язки (.json або .map) — пропускаю.")
                 continue
         except Exception as exc:
-            print(f"[schubert] Помилка в {fn}: {exc}")
+            _slog(f"[schubert] Помилка в {fn}: {exc}")
             continue
         if bounds is None:
-            print(f"[schubert] У {fn} менше 3 калібрувальних точок — пропускаю.")
+            _slog(f"[schubert] У {fn} менше 3 калібрувальних точок — пропускаю.")
             continue
         seen_ids.add(stem)
         sheets.append({"id": stem, "name": stem, "img": img, "bounds": bounds})
-    print(f"[schubert] Підключено листів: {len(sheets)}")
+    _slog(f"[schubert] Підключено листів: {len(sheets)}")
     return sheets
 
 
 SCHUBERT_SHEETS = _scan_schubert_sheets()
+_slog(f"[schubert] Перевірка: папка={os.path.isdir(SCHUBERT_DIR)}, листів={len(SCHUBERT_SHEETS)}")
 _SCHUBERT_BY_ID = {s_["id"]: s_ for s_ in SCHUBERT_SHEETS}
 
 
@@ -2312,7 +2328,7 @@ var ctl = L.control({position: 'bottomleft'});
 ctl.onAdd = function(){
   var d = L.DomUtil.create('div', 'leaflet-bar');
   d.style.cssText = 'background:#fff;padding:6px 8px;border-radius:6px;font-size:12px;color:#222;max-width:200px;max-height:45vh;overflow:auto';
-  var h = '<b>Старі карти</b><br>';
+  var h = '<b>Старі карти</b><br>Завантажено листів: __TOTAL__<br>' + (sheets.length ? '' : 'Для цієї області листів немає<br>');
   sheets.forEach(function(s, i){ h += '<label><input type="checkbox" data-i="' + i + '"> ' + s.name + '</label><br>'; });
   h += 'Прозорість <input type="range" id="sch_op" min="0" max="100" value="60" style="width:110px">';
   d.innerHTML = h;
@@ -2333,18 +2349,36 @@ setTimeout(function(){
 })();"""
 
 
-def _schubert_script(map_var: str, lat: float, lon: float, radius_km: float) -> str:
-    """Підключає лише ті листи, що перетинаються з областю пошуку (щоб не вантажити зайве)."""
+def _near_sheets(lat: float, lon: float, radius_km: float):
     s_lat, n_lat, w_lon, e_lon = _bbox(lat, lon, radius_km)
-    near = [s_ for s_ in SCHUBERT_SHEETS
+    return [s_ for s_ in SCHUBERT_SHEETS
             if not (s_["bounds"][1][0] < s_lat or s_["bounds"][0][0] > n_lat or
                     s_["bounds"][1][1] < w_lon or s_["bounds"][0][1] > e_lon)]
-    if not near:
-        return ""
+
+
+@app.get("/api/schubert/status")
+def api_schubert_status(lat: float = Query(None), lon: float = Query(None), radius_km: float = Query(5.0)):
+    """Діагностика: що знайшов сервер у data/schubert і які листи перетинають область пошуку."""
+    near = _near_sheets(lat, lon, radius_km) if (lat is not None and lon is not None) else []
+    return {
+        "dir": SCHUBERT_DIR,
+        "dir_exists": os.path.isdir(SCHUBERT_DIR),
+        "files": sorted(os.listdir(SCHUBERT_DIR)) if os.path.isdir(SCHUBERT_DIR) else None,
+        "loaded": [s_["id"] for s_ in SCHUBERT_SHEETS],
+        "near": [s_["id"] for s_ in near],
+        "log": SCHUBERT_LOG,
+    }
+
+
+def _schubert_script(map_var: str, lat: float, lon: float, radius_km: float) -> str:
+    """Меню «Старі карти» показується завжди; листи додаються лише ті, що перетинають область пошуку."""
+    near = _near_sheets(lat, lon, radius_km)
     items = [{"name": s_["name"], "url": f"{PUBLIC_BASE_URL}/schubert/{s_['id']}",
               "bounds": [[s_["bounds"][0][0], s_["bounds"][0][1]], [s_["bounds"][1][0], s_["bounds"][1][1]]]}
              for s_ in near]
-    js = _SCHUBERT_JS.replace("__DATA__", json.dumps(items, ensure_ascii=False)).replace("__MAP__", map_var)
+    js = (_SCHUBERT_JS.replace("__DATA__", json.dumps(items, ensure_ascii=False))
+          .replace("__MAP__", map_var)
+          .replace("__TOTAL__", str(len(SCHUBERT_SHEETS))))
     return "<script>" + js + "</script>\n"
 
 
