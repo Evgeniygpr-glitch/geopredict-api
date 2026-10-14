@@ -16,7 +16,7 @@ import srtm
 import folium
 from folium.raster_layers import WmsTileLayer, ImageOverlay
 from fastapi import FastAPI, Query
-from fastapi.responses import HTMLResponse, Response, JSONResponse
+from fastapi.responses import HTMLResponse, Response, JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 # --------------------------------------------------------------------------
@@ -274,6 +274,12 @@ app.add_middleware(
 # Публічна адреса сервісу — для посилань усередині карти (вона рендериться в iframe,
 # тому відносні посилання не працюють). Можна перекрити змінною PUBLIC_BASE_URL.
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "https://geopredict-api.onrender.com").rstrip("/")
+
+# XYZ-шаблон тайлів прив'язаного листа Шуберта, наприклад:
+#   https://<сервіс>/maps/tile/<id>/{z}/{x}/{y}.png
+# Якщо не задано — шар не показується.
+SCHUBERT_TILE_URL = os.environ.get("SCHUBERT_TILE_URL", "").strip()
+SCHUBERT_ATTR = "Мапа Шуберта (трьохверстівка), прив. користувачем"
 
 # Дані розробника для юридичних сторінок і User-Agent (політики Nominatim/Wikimedia вимагають контакт).
 APP_NAME = os.environ.get("APP_NAME", "GeoPredict")
@@ -2157,6 +2163,96 @@ def api_analyze(
 
 from html import escape as _html_escape
 
+SCHUBERT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "schubert")
+_SCHUBERT_PAT = re.compile(r"Point\d+=xy,\s*([\d.]+),\s*([\d.]+),\s*in,\s*deg,\s*(-?[\d.]+),\s*([\d.]+),\s*([EW]),"
+                           r"\s*(-?[\d.]+),\s*([\d.]+),\s*([NS])")
+_SCHUBERT_IMG_EXT = (".jpg", ".jpeg", ".png", ".gif")
+_SCHUBERT_MIME = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".gif": "image/gif"}
+
+
+def _read_ozi_bounds(map_path, img_path):
+    """Межі листа з OziExplorer .map (афінна апроксимація по калібрувальних точках)."""
+    pts = []
+    with open(map_path, encoding="latin-1") as f:
+        for line in f:
+            m = _SCHUBERT_PAT.search(line)
+            if not m:
+                continue
+            x, y = float(m[1]), float(m[2])
+            lon = float(m[3]) + float(m[4]) / 60.0
+            if m[5] == "W":
+                lon = -lon
+            lat = float(m[6]) + float(m[7]) / 60.0
+            if m[8] == "S":
+                lat = -lat
+            pts.append((x, y, lat, lon))
+    if len(pts) < 3:
+        return None
+    from PIL import Image as _Img
+    W, H = _Img.open(img_path).size
+    A = np.array([[x, y, 1.0] for x, y, _, _ in pts])
+    lat_c = np.linalg.lstsq(A, np.array([p_[2] for p_ in pts]), rcond=None)[0]
+    lon_c = np.linalg.lstsq(A, np.array([p_[3] for p_ in pts]), rcond=None)[0]
+    corners = []
+    for x, y in ((0, 0), (W, 0), (0, H), (W, H)):
+        v = np.array([x, y, 1.0])
+        corners.append((float(v @ lat_c), float(v @ lon_c)))
+    lats = [c_[0] for c_ in corners]
+    lons = [c_[1] for c_ in corners]
+    return (min(lats), min(lons)), (max(lats), max(lons))
+
+
+def _read_sidecar_bounds(json_path):
+    """Межі листа з <назва>.json, який створює tools/prep_sheets.py з точок QGIS."""
+    with open(json_path, encoding="utf-8") as f:
+        d = json.load(f)
+    return (float(d["south"]), float(d["west"])), (float(d["north"]), float(d["east"]))
+
+
+def _scan_schubert_sheets():
+    sheets = []
+    if not os.path.isdir(SCHUBERT_DIR):
+        print("[schubert] Папка data/schubert не знайдена — листи не підключено.")
+        return sheets
+    seen_ids = set()
+    for fn in sorted(os.listdir(SCHUBERT_DIR)):
+        stem, ext = os.path.splitext(fn)
+        if ext.lower() not in _SCHUBERT_IMG_EXT or stem in seen_ids:
+            continue
+        img = os.path.join(SCHUBERT_DIR, fn)
+        side_json = os.path.join(SCHUBERT_DIR, stem + ".json")
+        side_map = os.path.join(SCHUBERT_DIR, stem + ".map")
+        try:
+            if os.path.exists(side_json):
+                bounds = _read_sidecar_bounds(side_json)
+            elif os.path.exists(side_map):
+                bounds = _read_ozi_bounds(side_map, img)
+            else:
+                print(f"[schubert] Для {fn} немає прив'язки (.json або .map) — пропускаю.")
+                continue
+        except Exception as exc:
+            print(f"[schubert] Помилка в {fn}: {exc}")
+            continue
+        if bounds is None:
+            print(f"[schubert] У {fn} менше 3 калібрувальних точок — пропускаю.")
+            continue
+        seen_ids.add(stem)
+        sheets.append({"id": stem, "name": stem, "img": img, "bounds": bounds})
+    print(f"[schubert] Підключено листів: {len(sheets)}")
+    return sheets
+
+
+SCHUBERT_SHEETS = _scan_schubert_sheets()
+_SCHUBERT_BY_ID = {s_["id"]: s_ for s_ in SCHUBERT_SHEETS}
+
+
+@app.get("/schubert/{sheet_id}")
+def schubert_image(sheet_id: str):
+    s_ = _SCHUBERT_BY_ID.get(sheet_id)
+    if s_ is None:
+        return JSONResponse({"detail": "Лист не знайдено"}, status_code=404)
+    return FileResponse(s_["img"], media_type=_SCHUBERT_MIME.get(os.path.splitext(s_["img"])[1].lower(), "image/jpeg"))
+
 
 # Локальний список населених пунктів Сумщини (data/places_sumy.json), збирається
 # одноразово скриптом tools/build_places.py. Overpass з Render часто недоступний,
@@ -2206,6 +2302,50 @@ def get_place_labels(lat: float, lon: float, radius_km: float):
             last_exc = exc
             print(f"[labels] Overpass {url}: {type(exc).__name__}")
     raise RuntimeError(f"Overpass недоступний: {last_exc}")
+
+
+
+_SCHUBERT_JS = """(function(){
+var sheets = __DATA__;
+var layers = sheets.map(function(s){ return L.imageOverlay(s.url, s.bounds, {opacity: 0.6}); });
+var ctl = L.control({position: 'bottomleft'});
+ctl.onAdd = function(){
+  var d = L.DomUtil.create('div', 'leaflet-bar');
+  d.style.cssText = 'background:#fff;padding:6px 8px;border-radius:6px;font-size:12px;color:#222;max-width:200px;max-height:45vh;overflow:auto';
+  var h = '<b>Старі карти</b><br>';
+  sheets.forEach(function(s, i){ h += '<label><input type="checkbox" data-i="' + i + '"> ' + s.name + '</label><br>'; });
+  h += 'Прозорість <input type="range" id="sch_op" min="0" max="100" value="60" style="width:110px">';
+  d.innerHTML = h;
+  L.DomEvent.disableClickPropagation(d);
+  return d;
+};
+ctl.addTo(__MAP__);
+setTimeout(function(){
+  var op = document.getElementById('sch_op');
+  document.querySelectorAll('input[data-i]').forEach(function(cb){
+    cb.onchange = function(){
+      var l = layers[+cb.getAttribute('data-i')];
+      if (cb.checked) { l.addTo(__MAP__); } else { __MAP__.removeLayer(l); }
+    };
+  });
+  op.oninput = function(){ layers.forEach(function(l){ l.setOpacity(op.value / 100); }); };
+}, 0);
+})();"""
+
+
+def _schubert_script(map_var: str, lat: float, lon: float, radius_km: float) -> str:
+    """Підключає лише ті листи, що перетинаються з областю пошуку (щоб не вантажити зайве)."""
+    s_lat, n_lat, w_lon, e_lon = _bbox(lat, lon, radius_km)
+    near = [s_ for s_ in SCHUBERT_SHEETS
+            if not (s_["bounds"][1][0] < s_lat or s_["bounds"][0][0] > n_lat or
+                    s_["bounds"][1][1] < w_lon or s_["bounds"][0][1] > e_lon)]
+    if not near:
+        return ""
+    items = [{"name": s_["name"], "url": f"{PUBLIC_BASE_URL}/schubert/{s_['id']}",
+              "bounds": [[s_["bounds"][0][0], s_["bounds"][0][1]], [s_["bounds"][1][0], s_["bounds"][1][1]]]}
+             for s_ in near]
+    js = _SCHUBERT_JS.replace("__DATA__", json.dumps(items, ensure_ascii=False)).replace("__MAP__", map_var)
+    return "<script>" + js + "</script>\n"
 
 
 @app.api_route("/map", methods=["GET", "HEAD"], response_class=HTMLResponse)
@@ -2480,6 +2620,7 @@ def get_map(
             "  .finally(function(){clearInterval(tm); try{if(__geoMap._popup)__geoMap._popup.update();}catch(e){}});\n"
             "}</script>\n"
         )
+        info_script += _schubert_script(map_var, lat, lon, radius_km)
         html = html.replace("</body>", info_script + "</body>", 1)
 
     return HTMLResponse(content=html)
