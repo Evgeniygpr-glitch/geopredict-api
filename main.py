@@ -2321,34 +2321,6 @@ def get_place_labels(lat: float, lon: float, radius_km: float):
 
 
 
-_SCHUBERT_JS = """(function(){
-var sheets = __DATA__;
-var layers = sheets.map(function(s){ return L.imageOverlay(s.url, s.bounds, {opacity: 0.6}); });
-var ctl = L.control({position: 'topleft'});
-ctl.onAdd = function(){
-  var d = L.DomUtil.create('div', 'leaflet-bar');
-  d.style.cssText = 'background:#fff;padding:6px 8px;border-radius:6px;font-size:12px;color:#222;max-width:200px;max-height:45vh;overflow:auto;z-index:1000;box-shadow:0 1px 5px rgba(0,0,0,.4)';
-  var h = '<b>Старі карти</b><br>Завантажено листів: __TOTAL__<br>' + (sheets.length ? '' : 'Для цієї області листів немає<br>');
-  sheets.forEach(function(s, i){ h += '<label><input type="checkbox" data-i="' + i + '"> ' + s.name + '</label><br>'; });
-  h += 'Прозорість <input type="range" id="sch_op" min="0" max="100" value="60" style="width:110px">';
-  d.innerHTML = h;
-  L.DomEvent.disableClickPropagation(d);
-  return d;
-};
-ctl.addTo(__MAP__);
-setTimeout(function(){
-  var op = document.getElementById('sch_op');
-  document.querySelectorAll('input[data-i]').forEach(function(cb){
-    cb.onchange = function(){
-      var l = layers[+cb.getAttribute('data-i')];
-      if (cb.checked) { l.addTo(__MAP__); } else { __MAP__.removeLayer(l); }
-    };
-  });
-  op.oninput = function(){ layers.forEach(function(l){ l.setOpacity(op.value / 100); }); };
-}, 0);
-})();"""
-
-
 def _near_sheets(lat: float, lon: float, radius_km: float):
     s_lat, n_lat, w_lon, e_lon = _bbox(lat, lon, radius_km)
     return [s_ for s_ in SCHUBERT_SHEETS
@@ -2370,16 +2342,38 @@ def api_schubert_status(lat: float = Query(None), lon: float = Query(None), radi
     }
 
 
-def _schubert_script(map_var: str, lat: float, lon: float, radius_km: float) -> str:
-    """Меню «Старі карти» показується завжди; листи додаються лише ті, що перетинають область пошуку."""
-    near = _near_sheets(lat, lon, radius_km)
-    items = [{"name": s_["name"], "url": f"{PUBLIC_BASE_URL}/schubert/{s_['id']}",
-              "bounds": [[s_["bounds"][0][0], s_["bounds"][0][1]], [s_["bounds"][1][0], s_["bounds"][1][1]]]}
-             for s_ in near]
-    js = (_SCHUBERT_JS.replace("__DATA__", json.dumps(items, ensure_ascii=False))
-          .replace("__MAP__", map_var)
-          .replace("__TOTAL__", str(len(SCHUBERT_SHEETS))))
-    return "<script>" + js + "</script>\n"
+_SCHUBERT_SLIDER_JS = """(function(){
+var map = __MAP__;
+function sheetLayers(){
+  var out = [];
+  map.eachLayer(function(l){
+    if (l instanceof L.ImageOverlay && l._url && l._url.indexOf('/schubert/') >= 0) out.push(l);
+  });
+  return out;
+}
+function attach(){
+  var list = document.querySelector('.leaflet-control-layers-list');
+  if (!list) { setTimeout(attach, 300); return; }
+  var box = document.createElement('div');
+  box.style.cssText = 'border-top:1px solid #bbb;margin-top:6px;padding-top:6px;font-size:12px;min-width:170px';
+  box.innerHTML = 'Прозорість старих карт: <span id="sch_v">60</span>%<br>' +
+                  '<input type="range" id="sch_op" min="0" max="100" value="60" style="width:150px">';
+  list.appendChild(box);
+  L.DomEvent.disableClickPropagation(box);
+  document.getElementById('sch_op').oninput = function(){
+    var v = this.value;
+    document.getElementById('sch_v').textContent = v;
+    sheetLayers().forEach(function(l){ l.setOpacity(v / 100); });
+  };
+}
+attach();
+})();"""
+
+
+def _schubert_slider_script(map_var: str) -> str:
+    if not SCHUBERT_SHEETS:
+        return ""
+    return "<script>" + _SCHUBERT_SLIDER_JS.replace("__MAP__", map_var) + "</script>\n"
 
 
 @app.api_route("/map", methods=["GET", "HEAD"], response_class=HTMLResponse)
@@ -2594,6 +2588,16 @@ def get_map(
             ).add_to(hollow_fg)
         hollow_fg.add_to(m)
 
+    for s_ in _near_sheets(lat, lon, radius_km):
+        (s_south, s_west), (s_north, s_east) = s_["bounds"]
+        ImageOverlay(
+            image=f"{PUBLIC_BASE_URL}/schubert/{s_['id']}",
+            bounds=[[s_south, s_west], [s_north, s_east]],
+            opacity=0.6,
+            name=f"🗺️ Шуберт: {s_['name']}",
+            show=False,
+        ).add_to(m)
+
     folium.LayerControl(collapsed=True).add_to(m)
     html = m.get_root().render()
 
@@ -2654,7 +2658,7 @@ def get_map(
             "  .finally(function(){clearInterval(tm); try{if(__geoMap._popup)__geoMap._popup.update();}catch(e){}});\n"
             "}</script>\n"
         )
-        info_script += _schubert_script(map_var, lat, lon, radius_km)
+        info_script += _schubert_slider_script(map_var)
         html = html.replace("</body>", info_script + "</body>", 1)
 
     return HTMLResponse(content=html)
