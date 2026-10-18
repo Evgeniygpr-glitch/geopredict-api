@@ -2333,6 +2333,7 @@ def api_schubert_status(lat: float = Query(None), lon: float = Query(None), radi
     """Діагностика: що знайшов сервер у data/schubert і які листи перетинають область пошуку."""
     near = _near_sheets(lat, lon, radius_km) if (lat is not None and lon is not None) else []
     return {
+        "version": "5",
         "dir": SCHUBERT_DIR,
         "dir_exists": os.path.isdir(SCHUBERT_DIR),
         "files": sorted(os.listdir(SCHUBERT_DIR)) if os.path.isdir(SCHUBERT_DIR) else None,
@@ -2342,34 +2343,51 @@ def api_schubert_status(lat: float = Query(None), lon: float = Query(None), radi
     }
 
 
-_SCHUBERT_SLIDER_JS = """(function(){
+_SCHUBERT_JS = """(function(){
+var sheets = __DATA__;
 var map = __MAP__;
-var sliderVal = 0.6;
-function isSheet(l){ return l instanceof L.ImageOverlay && l._url && l._url.indexOf('/schubert/') >= 0; }
-map.on('overlayadd', function(e){ if (isSheet(e.layer)) e.layer.setOpacity(sliderVal); });
-function attach(){
-  var list = document.querySelector('.leaflet-control-layers-list');
-  if (!list) { setTimeout(attach, 300); return; }
-  var box = document.createElement('div');
-  box.style.cssText = 'border-top:1px solid #bbb;margin-top:6px;padding-top:6px;font-size:12px;min-width:170px';
-  box.innerHTML = 'Прозорість старих карт: <span id="sch_v">60</span>%<br>' +
-                  '<input type="range" id="sch_op" min="0" max="100" value="60" style="width:150px">';
-  list.appendChild(box);
-  L.DomEvent.disableClickPropagation(box);
+var opacity = 0.6;
+var layers = sheets.map(function(s){ return L.imageOverlay(s.url, s.bounds, {opacity: opacity}); });
+var ctl = L.control({position: 'topright'});
+ctl.onAdd = function(){
+  var d = L.DomUtil.create('div', 'leaflet-bar');
+  d.style.cssText = 'background:#fff;padding:6px 8px;border-radius:6px;font-size:12px;color:#222;max-width:210px;box-shadow:0 1px 5px rgba(0,0,0,.4)';
+  var h = '<b>Старі карти</b><br>Листів: __TOTAL__';
+  if (!sheets.length) { h += '<br>Для цієї області листів немає'; }
+  sheets.forEach(function(s, i){ h += '<label><input type="checkbox" data-i="' + i + '"> ' + s.name + '</label><br>'; });
+  h += '<div style="margin-top:4px">Прозорість: <span id="sch_v">60</span>%</div>';
+  h += '<input type="range" id="sch_op" min="0" max="100" value="60" style="width:180px">';
+  d.innerHTML = h;
+  L.DomEvent.disableClickPropagation(d);
+  return d;
+};
+ctl.addTo(map);
+setTimeout(function(){
+  document.querySelectorAll('input[data-i]').forEach(function(cb){
+    cb.onchange = function(){
+      var l = layers[+cb.getAttribute('data-i')];
+      if (cb.checked) { l.addTo(map); } else { map.removeLayer(l); }
+    };
+  });
   document.getElementById('sch_op').oninput = function(){
-    sliderVal = this.value / 100;
+    opacity = this.value / 100;
     document.getElementById('sch_v').textContent = this.value;
-    map.eachLayer(function(l){ if (isSheet(l)) l.setOpacity(sliderVal); });
+    layers.forEach(function(l){ l.setOpacity(opacity); });
   };
-}
-attach();
+}, 0);
 })();"""
 
 
-def _schubert_slider_script(map_var: str) -> str:
-    if not SCHUBERT_SHEETS:
-        return ""
-    return "<script>" + _SCHUBERT_SLIDER_JS.replace("__MAP__", map_var) + "</script>\n"
+def _schubert_script(map_var: str, lat: float, lon: float, radius_km: float) -> str:
+    """Окремий блок «Старі карти» справа вгорі: чекбокси листів і повзунок прозорості (завжди видно)."""
+    near = _near_sheets(lat, lon, radius_km)
+    items = [{"name": s_["name"], "url": f"{PUBLIC_BASE_URL}/schubert/{s_['id']}",
+              "bounds": [[s_["bounds"][0][0], s_["bounds"][0][1]], [s_["bounds"][1][0], s_["bounds"][1][1]]]}
+             for s_ in near]
+    js = (_SCHUBERT_JS.replace("__DATA__", json.dumps(items, ensure_ascii=False))
+          .replace("__MAP__", map_var)
+          .replace("__TOTAL__", str(len(SCHUBERT_SHEETS))))
+    return "<script>" + js + "</script>\n"
 
 
 @app.api_route("/map", methods=["GET", "HEAD"], response_class=HTMLResponse)
@@ -2584,16 +2602,6 @@ def get_map(
             ).add_to(hollow_fg)
         hollow_fg.add_to(m)
 
-    for s_ in _near_sheets(lat, lon, radius_km):
-        (s_south, s_west), (s_north, s_east) = s_["bounds"]
-        ImageOverlay(
-            image=f"{PUBLIC_BASE_URL}/schubert/{s_['id']}",
-            bounds=[[s_south, s_west], [s_north, s_east]],
-            opacity=0.6,
-            name=f"🗺️ Шуберт: {s_['name']}",
-            show=False,
-        ).add_to(m)
-
     folium.LayerControl(collapsed=True).add_to(m)
     html = m.get_root().render()
 
@@ -2654,7 +2662,7 @@ def get_map(
             "  .finally(function(){clearInterval(tm); try{if(__geoMap._popup)__geoMap._popup.update();}catch(e){}});\n"
             "}</script>\n"
         )
-        info_script += _schubert_slider_script(map_var)
+        info_script += _schubert_script(map_var, lat, lon, radius_km)
         html = html.replace("</body>", info_script + "</body>", 1)
 
     return HTMLResponse(content=html)
