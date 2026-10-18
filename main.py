@@ -2344,13 +2344,9 @@ def api_schubert_status(lat: float = Query(None), lon: float = Query(None), radi
 
 _SCHUBERT_SLIDER_JS = """(function(){
 var map = __MAP__;
-function sheetLayers(){
-  var out = [];
-  map.eachLayer(function(l){
-    if (l instanceof L.ImageOverlay && l._url && l._url.indexOf('/schubert/') >= 0) out.push(l);
-  });
-  return out;
-}
+var sliderVal = 0.6;
+function isSheet(l){ return l instanceof L.ImageOverlay && l._url && l._url.indexOf('/schubert/') >= 0; }
+map.on('overlayadd', function(e){ if (isSheet(e.layer)) e.layer.setOpacity(sliderVal); });
 function attach(){
   var list = document.querySelector('.leaflet-control-layers-list');
   if (!list) { setTimeout(attach, 300); return; }
@@ -2361,9 +2357,9 @@ function attach(){
   list.appendChild(box);
   L.DomEvent.disableClickPropagation(box);
   document.getElementById('sch_op').oninput = function(){
-    var v = this.value;
-    document.getElementById('sch_v').textContent = v;
-    sheetLayers().forEach(function(l){ l.setOpacity(v / 100); });
+    sliderVal = this.value / 100;
+    document.getElementById('sch_v').textContent = this.value;
+    map.eachLayer(function(l){ if (isSheet(l)) l.setOpacity(sliderVal); });
   };
 }
 attach();
