@@ -2345,36 +2345,40 @@ def api_schubert_status(lat: float = Query(None), lon: float = Query(None), radi
 
 _SCHUBERT_JS = """(function(){
 var sheets = __DATA__;
-var map = __MAP__;
 var opacity = 0.6;
-var layers = sheets.map(function(s){ return L.imageOverlay(s.url, s.bounds, {opacity: opacity}); });
-var ctl = L.control({position: 'topright'});
-ctl.onAdd = function(){
-  var d = L.DomUtil.create('div', 'leaflet-bar');
-  d.style.cssText = 'background:#fff;padding:6px 8px;border-radius:6px;font-size:12px;color:#222;max-width:210px;box-shadow:0 1px 5px rgba(0,0,0,.4)';
-  var h = '<b>Старі карти</b><br>Листів: __TOTAL__';
-  if (!sheets.length) { h += '<br>Для цієї області листів немає'; }
-  sheets.forEach(function(s, i){ h += '<label><input type="checkbox" data-i="' + i + '"> ' + s.name + '</label><br>'; });
-  h += '<div style="margin-top:4px">Прозорість: <span id="sch_v">60</span>%</div>';
-  h += '<input type="range" id="sch_op" min="0" max="100" value="60" style="width:180px">';
-  d.innerHTML = h;
-  L.DomEvent.disableClickPropagation(d);
-  return d;
-};
-ctl.addTo(map);
-setTimeout(function(){
-  document.querySelectorAll('input[data-i]').forEach(function(cb){
-    cb.onchange = function(){
-      var l = layers[+cb.getAttribute('data-i')];
-      if (cb.checked) { l.addTo(map); } else { map.removeLayer(l); }
+function init(){
+  var map = __MAP__;
+  if (!map || typeof map.addControl !== 'function') { return; }
+  map.whenReady(function(){
+    var layers = sheets.map(function(s){ return L.imageOverlay(s.url, s.bounds, {opacity: opacity}); });
+    var ctl = L.control({position: 'topright'});
+    ctl.onAdd = function(){
+      var d = L.DomUtil.create('div', 'leaflet-bar');
+      d.style.cssText = 'background:#fff;padding:6px 8px;border-radius:6px;font-size:12px;color:#222;max-width:210px;box-shadow:0 1px 5px rgba(0,0,0,.4)';
+      var h = '<b>Старі карти</b><br>Листів: __TOTAL__';
+      if (!sheets.length) { h += '<br>Для цієї області листів немає'; }
+      sheets.forEach(function(s, i){ h += '<label><input type="checkbox" data-i="' + i + '"> ' + s.name + '</label><br>'; });
+      h += '<div style="margin-top:4px">Прозорість: <span id="sch_v">60</span>%</div>';
+      h += '<input type="range" id="sch_op" min="0" max="100" value="60" style="width:180px">';
+      d.innerHTML = h;
+      L.DomEvent.disableClickPropagation(d);
+      return d;
+    };
+    map.addControl(ctl);
+    document.querySelectorAll('input[data-i]').forEach(function(cb){
+      cb.onchange = function(){
+        var l = layers[+cb.getAttribute('data-i')];
+        if (cb.checked) { l.addTo(map); } else { map.removeLayer(l); }
+      };
+    });
+    document.getElementById('sch_op').oninput = function(){
+      opacity = this.value / 100;
+      document.getElementById('sch_v').textContent = this.value;
+      layers.forEach(function(l){ l.setOpacity(opacity); });
     };
   });
-  document.getElementById('sch_op').oninput = function(){
-    opacity = this.value / 100;
-    document.getElementById('sch_v').textContent = this.value;
-    layers.forEach(function(l){ l.setOpacity(opacity); });
-  };
-}, 0);
+}
+if (document.readyState === 'complete') { init(); } else { window.addEventListener('load', init); }
 })();"""
 
 
