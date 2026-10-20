@@ -1842,6 +1842,14 @@ def credits_page():
 </ul>
 <p><a href="/privacy">Політика конфіденційності</a> · <a href="/terms">Умови використання</a></p>
 """
+    from html import escape as _esc
+    seen_c, extra = set(), ""
+    for s_ in SCHUBERT_SHEETS:
+        if s_.get("source") and s_["source"][1] not in seen_c:
+            seen_c.add(s_["source"][1])
+            extra += (f'<li>Прив\'язка листів: <a href="{_esc(s_["source"][1])}">{_esc(s_["source"][0])}</a>. '
+                      f'Використано з дозволу автора.</li>\n')
+    body = body.replace("</ul>", extra + "</ul>", 1)
     return _legal_page("Джерела даних", body, "uk")
 
 
@@ -2252,7 +2260,16 @@ def _scan_schubert_sheets():
             _slog(f"[schubert] У {fn} менше 3 калібрувальних точок — пропускаю.")
             continue
         seen_ids.add(stem)
-        sheets.append({"id": stem, "name": stem, "img": img, "bounds": bounds})
+        meta = {}
+        if os.path.exists(side_json):
+            try:
+                with open(side_json, encoding="utf-8") as jf:
+                    meta = json.load(jf)
+            except Exception:
+                meta = {}
+        src_name, src_url = meta.get("source_name"), meta.get("source_url")
+        sheets.append({"id": stem, "name": stem, "img": img, "bounds": bounds,
+                       "source": (src_name, src_url) if (src_name and src_url) else None})
     _slog(f"[schubert] Підключено листів: {len(sheets)}")
     return sheets
 
@@ -2345,6 +2362,7 @@ def api_schubert_status(lat: float = Query(None), lon: float = Query(None), radi
 
 _SCHUBERT_JS = """(function(){
 var sheets = __DATA__;
+var sources = __SOURCES__;
 var opacity = 0.6;
 function init(){
   var map = __MAP__;
@@ -2360,6 +2378,10 @@ function init(){
       sheets.forEach(function(s, i){ h += '<label><input type="checkbox" data-i="' + i + '"> ' + s.name + '</label><br>'; });
       h += '<div style="margin-top:4px">Прозорість: <span id="sch_v">60</span>%</div>';
       h += '<input type="range" id="sch_op" min="0" max="100" value="60" style="width:180px">';
+      if (sources.length) {
+        h += '<div style="margin-top:6px;font-size:11px;line-height:1.3">Прив\'язка: ' +
+             sources.map(function(x){ return '<a href="' + x.url + '" target="_blank">' + x.name + '</a>'; }).join(', ') + '</div>';
+      }
       d.innerHTML = h;
       L.DomEvent.disableClickPropagation(d);
       return d;
@@ -2388,7 +2410,13 @@ def _schubert_script(map_var: str, lat: float, lon: float, radius_km: float) -> 
     items = [{"name": s_["name"], "url": f"{PUBLIC_BASE_URL}/schubert/{s_['id']}",
               "bounds": [[s_["bounds"][0][0], s_["bounds"][0][1]], [s_["bounds"][1][0], s_["bounds"][1][1]]]}
              for s_ in near]
+    srcs, seen_src = [], set()
+    for s_ in near:
+        if s_.get("source") and s_["source"][1] not in seen_src:
+            seen_src.add(s_["source"][1])
+            srcs.append({"name": s_["source"][0], "url": s_["source"][1]})
     js = (_SCHUBERT_JS.replace("__DATA__", json.dumps(items, ensure_ascii=False))
+          .replace("__SOURCES__", json.dumps(srcs, ensure_ascii=False))
           .replace("__MAP__", map_var)
           .replace("__TOTAL__", str(len(SCHUBERT_SHEETS))))
     return "<script>" + js + "</script>\n"
