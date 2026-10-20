@@ -2379,7 +2379,7 @@ function init(){
       h += '<div style="margin-top:4px">Прозорість: <span id="sch_v">60</span>%</div>';
       h += '<input type="range" id="sch_op" min="0" max="100" value="60" style="width:180px">';
       if (sources.length) {
-        h += '<div style="margin-top:6px;font-size:11px;line-height:1.3">Прив\'язка: ' +
+        h += '<div style="margin-top:6px;font-size:11px;line-height:1.3">Прив&#39;язка: ' +
              sources.map(function(x){ return '<a href="' + x.url + '" target="_blank">' + x.name + '</a>'; }).join(', ') + '</div>';
       }
       d.innerHTML = h;
