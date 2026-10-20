@@ -2350,7 +2350,7 @@ def api_schubert_status(lat: float = Query(None), lon: float = Query(None), radi
     """Діагностика: що знайшов сервер у data/schubert і які листи перетинають область пошуку."""
     near = _near_sheets(lat, lon, radius_km) if (lat is not None and lon is not None) else []
     return {
-        "version": "5",
+        "version": "10",
         "dir": SCHUBERT_DIR,
         "dir_exists": os.path.isdir(SCHUBERT_DIR),
         "files": sorted(os.listdir(SCHUBERT_DIR)) if os.path.isdir(SCHUBERT_DIR) else None,
