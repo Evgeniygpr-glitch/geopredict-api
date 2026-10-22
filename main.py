@@ -2181,8 +2181,8 @@ from html import escape as _html_escape
 SCHUBERT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "schubert")
 _SCHUBERT_PAT = re.compile(r"Point\d+=xy,\s*([\d.]+),\s*([\d.]+),\s*in,\s*deg,\s*(-?[\d.]+),\s*([\d.]+),\s*([EW]),"
                            r"\s*(-?[\d.]+),\s*([\d.]+),\s*([NS])")
-_SCHUBERT_IMG_EXT = (".jpg", ".jpeg", ".png", ".gif")
-_SCHUBERT_MIME = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".gif": "image/gif"}
+_SCHUBERT_IMG_EXT = (".webp", ".png", ".jpg", ".jpeg", ".gif")   # порядок = пріоритет, якщо є кілька файлів листа
+_SCHUBERT_MIME = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".gif": "image/gif", ".webp": "image/webp"}
 
 
 def _read_ozi_bounds(map_path, img_path):
@@ -2238,9 +2238,14 @@ def _scan_schubert_sheets():
         _slog("[schubert] Папка data/schubert не знайдена — листи не підключено.")
         return sheets
     seen_ids = set()
-    for fn in sorted(os.listdir(SCHUBERT_DIR)):
+    by_stem = {}
+    for fn in os.listdir(SCHUBERT_DIR):
         stem, ext = os.path.splitext(fn)
-        if ext.lower() not in _SCHUBERT_IMG_EXT or stem in seen_ids:
+        if ext.lower() in _SCHUBERT_IMG_EXT:
+            by_stem.setdefault(stem, []).append(fn)
+    for stem in sorted(by_stem):
+        fn = sorted(by_stem[stem], key=lambda f_: _SCHUBERT_IMG_EXT.index(os.path.splitext(f_)[1].lower()))[0]
+        if stem in seen_ids:
             continue
         img = os.path.join(SCHUBERT_DIR, fn)
         side_json = os.path.join(SCHUBERT_DIR, stem + ".json")
@@ -2350,7 +2355,7 @@ def api_schubert_status(lat: float = Query(None), lon: float = Query(None), radi
     """Діагностика: що знайшов сервер у data/schubert і які листи перетинають область пошуку."""
     near = _near_sheets(lat, lon, radius_km) if (lat is not None and lon is not None) else []
     return {
-        "version": "10",
+        "version": "12",
         "dir": SCHUBERT_DIR,
         "dir_exists": os.path.isdir(SCHUBERT_DIR),
         "files": sorted(os.listdir(SCHUBERT_DIR)) if os.path.isdir(SCHUBERT_DIR) else None,
